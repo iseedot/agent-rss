@@ -1,9 +1,9 @@
 {
   "name": "pi-agent-rss",
-  "version": "0.2.1",
-  "private": true,
+  "version": "0.3.0",
+  "license": "MIT",
   "type": "module",
-  "description": "RSS aggregation plugin: add/fetch/unread/search/markread/list/remove, optional scheduled fetch",
+  "description": "RSS aggregation plugin: add/fetch/unread/search/markread/list/remove, feed tags for category filtering, optional scheduled fetch",
   "keywords": ["pi-package"],
   "scripts": {
     "check": "echo 'nothing to check'"

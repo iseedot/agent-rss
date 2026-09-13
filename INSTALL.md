@@ -94,6 +94,8 @@ Manage feeds:     rss list / rss remove <feed_id>
 ## Data notes
 
 - The database is SQLite (tables: `rss_feeds` / `rss_items` / `rss_items_fts`).
+- `rss_feeds.tags` (comma-separated) enables category filtering via `rss unread -t <tag>`,
+  `rss search -t <tag>`, and `rss list -t <tag>`; existing databases are migrated automatically.
 - The database lives **outside the plugin directory** (default: `<pi config dir>/rss-data/rss.db`),
   so package updates (`pi update`) never wipe subscriptions or read state.
 - Old plugin-dir databases (`data/rss.db`) are migrated automatically on first run.

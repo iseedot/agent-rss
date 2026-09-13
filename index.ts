@@ -9,7 +9,8 @@
  * Note: the database defaults to <pi config dir>/rss-data/rss.db (outside the
  * plugin directory) so package updates never wipe it.
  *
- * Tools: add / fetch / unread / search / markread / list / remove
+ * Tools: add / fetch / unread / search / markread / list / remove / tag / tags
+ * Feeds can carry comma-separated tags; unread / search / list filter by tag.
  * Optional scheduling: set RSS_AUTO_FETCH_MINUTES (e.g. 60) to fetch
  * periodically and push new items to the agent.
  */
@@ -74,21 +75,31 @@ const rssTool = defineTool({
   name: "rss",
   label: "RSS News",
   description:
-    "RSS tool: add a subscription (add), fetch updates (fetch), list unread items (unread), " +
-    "full-text search (search), mark items as read (markread), manage subscriptions (list/remove). " +
+    "RSS tool: add a subscription (add), tag feeds for category filtering (tag/tags), " +
+    "fetch updates (fetch), list unread items (unread), full-text search (search), " +
+    "mark items as read (markread), manage subscriptions (list/remove). " +
+    "unread/search/list accept a tag filter to see only one category. " +
     "Data is stored in the plugin's data/rss.db by default (override with RSS_DB_PATH).",
   parameters: Type.Object({
     action: Type.Union([
-      Type.Literal("add", { description: "Add a subscription; requires feed_url" }),
+      Type.Literal("add", { description: "Add a subscription; requires feed_url, optional tags" }),
+      Type.Literal("tag", { description: "Set/replace tags on a feed; requires feed_id, tags (comma-separated)" }),
+      Type.Literal("tags", { description: "List all tags in use with feed counts" }),
       Type.Literal("fetch", { description: "Fetch all enabled subscriptions" }),
-      Type.Literal("unread", { description: "List unread items" }),
-      Type.Literal("search", { description: "Full-text search; requires query" }),
+      Type.Literal("unread", { description: "List unread items (optional tag filter)" }),
+      Type.Literal("search", { description: "Full-text search; requires query (optional tag filter)" }),
       Type.Literal("markread", { description: "Mark items as read (all unread, or one by item_id)" }),
-      Type.Literal("list", { description: "List subscriptions" }),
+      Type.Literal("list", { description: "List subscriptions (optional tag filter)" }),
       Type.Literal("remove", { description: "Remove a subscription; requires feed_id" }),
     ]),
     feed_url: Type.Optional(
       Type.String({ description: "Feed URL (required for action=add)" }),
+    ),
+    tags: Type.Optional(
+      Type.String({ description: "Comma-separated tags, e.g. tech,news (actions add and tag)" }),
+    ),
+    tag: Type.Optional(
+      Type.String({ description: "Filter by tag/category (actions unread, search, list)" }),
     ),
     query: Type.Optional(
       Type.String({ description: "Search keyword (required for action=search; supports FTS5 syntax)" }),
@@ -100,7 +111,7 @@ const rssTool = defineTool({
       Type.Integer({ description: "Item ID (optional for markread; all unread when omitted)" }),
     ),
     feed_id: Type.Optional(
-      Type.Integer({ description: "Feed ID (required for action=remove)" }),
+      Type.Integer({ description: "Feed ID (required for actions remove and tag)" }),
     ),
   }),
 
@@ -113,6 +124,11 @@ const rssTool = defineTool({
     if (params.action === "add") {
       if (!params.feed_url) return { content: [{ type: "text", text: "❌ action=add requires feed_url" }] };
       args.push(params.feed_url);
+      if (params.tags) args.push("-t", params.tags);
+    } else if (params.action === "tag") {
+      if (params.feed_id == null) return { content: [{ type: "text", text: "❌ action=tag requires feed_id" }] };
+      args.push(String(params.feed_id));
+      if (params.tags) args.push("-t", params.tags);
     } else if (params.action === "search") {
       if (!params.query) return { content: [{ type: "text", text: "❌ action=search requires query" }] };
       args.push(params.query);
@@ -121,6 +137,10 @@ const rssTool = defineTool({
     } else if (params.action === "remove") {
       if (params.feed_id == null) return { content: [{ type: "text", text: "❌ action=remove requires feed_id" }] };
       args.push(String(params.feed_id));
+    }
+
+    if (params.tag && (params.action === "unread" || params.action === "search" || params.action === "list")) {
+      args.push("-t", params.tag);
     }
 
     if (params.limit != null && (params.action === "unread" || params.action === "search")) {

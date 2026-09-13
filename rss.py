@@ -6,7 +6,9 @@ Design:
 - Fixed database schema: rss_feeds / rss_items / rss_items_fts
 - Database defaults to <pi config dir>/rss-data/rss.db; override with RSS_DB_PATH
 
-Commands: add / fetch / unread / search / markread / list / remove
+Commands: add / fetch / unread / search / markread / list / remove / tag / tags
+Feeds carry comma-separated tags (rss_feeds.tags) for category filtering
+(unread/search/list accept -t to filter by tag).
 """
 from __future__ import annotations
 
@@ -89,6 +91,7 @@ SCHEMAS = [
         title TEXT,
         link TEXT,
         description TEXT,
+        tags TEXT NOT NULL DEFAULT '',
         last_modified TEXT,
         etag TEXT,
         last_fetch_time INTEGER,
@@ -181,11 +184,21 @@ def migrate_legacy_db():
         print(f"ℹ️ Migrated database from {legacy} to {DB_PATH}")
 
 
+def migrate_schema(conn: sqlite3.Connection):
+    """Additive migrations for existing databases: CREATE IF NOT EXISTS only
+    covers new databases, so column additions must be applied explicitly."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(rss_feeds)").fetchall()}
+    if "tags" not in cols:
+        conn.execute("ALTER TABLE rss_feeds ADD COLUMN tags TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+
+
 def init_db():
     migrate_legacy_db()
     conn = get_conn()
     try:
         conn.executescript("".join(SCHEMAS))
+        migrate_schema(conn)
     finally:
         conn.close()
 
@@ -197,6 +210,7 @@ class Feed:
     title: Optional[str] = None
     link: Optional[str] = None
     description: Optional[str] = None
+    tags: str = ""
     last_modified: Optional[str] = None
     etag: Optional[str] = None
     last_fetch_time: Optional[datetime] = None
@@ -228,6 +242,7 @@ def _feed_from_row(row: sqlite3.Row) -> Feed:
         title=row["title"],
         link=row["link"],
         description=row["description"],
+        tags=row["tags"] or "",
         last_modified=row["last_modified"],
         etag=row["etag"],
         last_fetch_time=datetime.fromtimestamp(row["last_fetch_time"]) if row["last_fetch_time"] else None,
@@ -256,13 +271,25 @@ def _item_from_row(row: sqlite3.Row) -> Item:
 
 # ---- feeds ----
 
-def add_feed(url: str) -> int:
+def _norm_tags(tags: str) -> str:
+    """Normalize a comma-separated tag string: trim each tag, drop empties."""
+    return ",".join(t.strip() for t in tags.split(",") if t.strip())
+
+
+def _tag_match_sql(column: str) -> str:
+    """SQL fragment matching a feed whose comma-separated tags contain the
+    bound parameter exactly (case-insensitive, no substring false positives)."""
+    return f"',' || lower({column}) || ',' LIKE '%,' || lower(?) || ',%'"
+
+
+def add_feed(url: str, tags: str = "") -> int:
     now = int(time.time())
+    tags = _norm_tags(tags)
     conn = get_conn()
     try:
         cur = conn.execute(
-            "INSERT OR IGNORE INTO rss_feeds (url, created_at, updated_at) VALUES (?, ?, ?)",
-            (url, now, now),
+            "INSERT OR IGNORE INTO rss_feeds (url, tags, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (url, tags, now, now),
         )
         conn.commit()
         if cur.rowcount == 0:
@@ -273,14 +300,20 @@ def add_feed(url: str) -> int:
         conn.close()
 
 
-def get_all_feeds(enabled_only: bool = True) -> list[Feed]:
+def get_all_feeds(enabled_only: bool = True, tag: Optional[str] = None) -> list[Feed]:
     conn = get_conn()
     try:
         sql = "SELECT * FROM rss_feeds"
+        where, params = [], []
         if enabled_only:
-            sql += " WHERE enabled = 1"
+            where.append("enabled = 1")
+        if tag:
+            where.append(_tag_match_sql("tags"))
+            params.append(tag)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY id"
-        return [_feed_from_row(r) for r in conn.execute(sql).fetchall()]
+        return [_feed_from_row(r) for r in conn.execute(sql, params).fetchall()]
     finally:
         conn.close()
 
@@ -360,18 +393,22 @@ def add_item(item: Item) -> Optional[int]:
         conn.close()
 
 
-def get_items(unread_only: bool = False, limit: int = 100, feed_id: Optional[int] = None) -> list[Item]:
+def get_items(unread_only: bool = False, limit: int = 100, feed_id: Optional[int] = None,
+              tag: Optional[str] = None) -> list[Item]:
     limit = max(1, min(int(limit), MAX_ITEM_LIMIT))
     where, params = [], []
     if feed_id:
-        where.append("feed_id = ?")
+        where.append("i.feed_id = ?")
         params.append(feed_id)
     if unread_only:
-        where.append("is_read = 0")
-    sql = "SELECT * FROM rss_items"
+        where.append("i.is_read = 0")
+    if tag:
+        where.append(_tag_match_sql("f.tags"))
+        params.append(tag)
+    sql = "SELECT i.* FROM rss_items i JOIN rss_feeds f ON f.id = i.feed_id"
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY published DESC LIMIT ?"
+    sql += " ORDER BY i.published DESC LIMIT ?"
     params.append(limit)
     conn = get_conn()
     try:
@@ -408,19 +445,26 @@ def mark_all_read() -> int:
         conn.close()
 
 
-def search_items(query: str, limit: int = 50) -> list[Item]:
+def search_items(query: str, limit: int = 50, tag: Optional[str] = None) -> list[Item]:
     query = (query or "").strip()[:MAX_SEARCH_QUERY]
     if not query:
         return []
     limit = max(1, min(int(limit), MAX_ITEM_LIMIT))
-    sql = """SELECT rss_items.* FROM rss_items
-             JOIN rss_items_fts ON rss_items.id = rss_items_fts.rowid
-             WHERE rss_items_fts MATCH ? ORDER BY published DESC LIMIT ?"""
+    sql = """SELECT i.* FROM rss_items i
+             JOIN rss_items_fts ON i.id = rss_items_fts.rowid
+             JOIN rss_feeds f ON f.id = i.feed_id
+             WHERE rss_items_fts MATCH ?"""
+    args: list = [None, limit]
+    if tag:
+        sql += " AND " + _tag_match_sql("f.tags")
+        args.insert(1, tag)
+    sql += " ORDER BY i.published DESC LIMIT ?"
     conn = get_conn()
     try:
         for candidate in (query, '"' + query.replace('"', '""') + '"'):
+            args[0] = candidate
             try:
-                return [_item_from_row(r) for r in conn.execute(sql, (candidate, limit)).fetchall()]
+                return [_item_from_row(r) for r in conn.execute(sql, args).fetchall()]
             except sqlite3.OperationalError:
                 continue
         return []
@@ -517,7 +561,7 @@ def fetch_feed(feed: Feed) -> int:
     """Fetch a single feed; returns the number of new items"""
     if feed.id is None:
         return 0
-    headers = {"User-Agent": "pi-agent-rss/0.2.1", "Accept-Encoding": "gzip"}
+    headers = {"User-Agent": "pi-agent-rss/0.3.0", "Accept-Encoding": "gzip"}
     if feed.last_modified:
         headers["If-Modified-Since"] = feed.last_modified
     if feed.etag:
@@ -634,9 +678,15 @@ def _pretty_items(items: list[Item]) -> list[str]:
 # CLI commands
 # ---------------------------------------------------------------------------
 
-def cmd_add(url: str) -> str:
-    feed_id = add_feed(url)
-    return f"✅ Feed added\nFeed ID: {feed_id}\nURL: {url}"
+def cmd_add(url: str, tags: str = "") -> str:
+    tags = _norm_tags(tags)
+    feed_id = add_feed(url, tags)
+    lines = [f"✅ Feed added", f"Feed ID: {feed_id}", f"URL: {url}"]
+    if tags:
+        lines.append(f"Tags: {tags}")
+    else:
+        lines.append("💡 Tip: tag it later with: tag <feed_id> -t tag1,tag2")
+    return "\n".join(lines)
 
 
 def cmd_fetch() -> str:
@@ -662,19 +712,21 @@ def cmd_fetch() -> str:
     return "\n".join(lines)
 
 
-def cmd_unread(limit: int) -> str:
-    items = get_items(unread_only=True, limit=limit)
+def cmd_unread(limit: int, tag: Optional[str] = None) -> str:
+    items = get_items(unread_only=True, limit=limit, tag=tag)
     if not items:
-        return "No unread items"
-    return "\n".join([f"📰 Unread items ({len(items)})", ""] + _pretty_items(items)
+        return f"No unread items{' with tag ' + tag if tag else ''}"
+    header = f"📰 Unread items ({len(items)})" + (f" tagged '{tag}'" if tag else "")
+    return "\n".join([header, ""] + _pretty_items(items)
                      + ["💡 Tip: use markread after reading"])
 
 
-def cmd_search(query: str, limit: int) -> str:
-    items = search_items(query, limit=limit)
+def cmd_search(query: str, limit: int, tag: Optional[str] = None) -> str:
+    items = search_items(query, limit=limit, tag=tag)
     if not items:
         return f"No items found for '{query}'"
-    return "\n".join([f"🔍 Search results: '{query}' ({len(items)})", ""] + _pretty_items(items))
+    header = f"🔍 Search results: '{query}' ({len(items)})" + (f" tagged '{tag}'" if tag else "")
+    return "\n".join([header, ""] + _pretty_items(items))
 
 
 def cmd_markread(item_id: Optional[int]) -> str:
@@ -692,16 +744,50 @@ def cmd_markread(item_id: Optional[int]) -> str:
     return f"✅ Marked {count} item(s) as read" if count else "No unread items to mark"
 
 
-def cmd_list() -> str:
-    feeds = get_all_feeds()
+def cmd_list(tag: Optional[str] = None) -> str:
+    feeds = get_all_feeds(tag=tag)
     if not feeds:
-        return "No subscriptions"
-    lines = [f"📡 Subscriptions ({len(feeds)})", ""]
+        return f"No subscriptions{' with tag ' + tag if tag else ''}"
+    lines = [f"📡 Subscriptions ({len(feeds)})" + (f" tagged '{tag}'" if tag else ""), ""]
     for feed in feeds:
         status = "✅" if feed.enabled else "⏸"
         title = feed.title or "(not fetched yet)"
         err = f"  ⚠️ {feed.fetch_error}" if feed.fetch_error else ""
-        lines.append(f"{status} ID {feed.id} {title}{err}\n    {feed.url}")
+        tags = f"  🏷️ {feed.tags}" if feed.tags else ""
+        lines.append(f"{status} ID {feed.id} {title}{tags}{err}\n    {feed.url}")
+    return "\n".join(lines)
+
+
+def cmd_tag(feed_id: int, tags: str = "") -> str:
+    """Set/replace tags on a feed; without -t, show current tags."""
+    feed = get_feed(feed_id)
+    if not feed:
+        return f"❌ No feed with ID {feed_id}"
+    tags = _norm_tags(tags)
+    if not tags:
+        return f"📌 Tags for ID {feed_id} '{feed.title or feed.url}': {feed.tags or '(none)'}"
+    update_feed_metadata(feed_id, tags=tags)
+    return f"✅ Tags updated for ID {feed_id}: {tags}"
+
+
+def cmd_tags() -> str:
+    """List all tags in use with feed counts."""
+    conn = get_conn()
+    try:
+        rows = conn.execute("SELECT tags FROM rss_feeds WHERE tags != ''").fetchall()
+    finally:
+        conn.close()
+    counts: dict[str, int] = {}
+    for row in rows:
+        for t in row["tags"].split(","):
+            t = t.strip()
+            if t:
+                counts[t] = counts.get(t, 0) + 1
+    if not counts:
+        return "No tags yet (use: rss tag <feed_id> -t tag1,tag2)"
+    lines = [f"🏷️ Tags ({len(counts)})", ""]
+    for t, c in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        lines.append(f"  {t} ({c} feed(s))")
     return "\n".join(lines)
 
 
@@ -721,28 +807,40 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rss.py", description="pi-agent-rss aggregator")
     sub = parser.add_subparsers(dest="action", required=True)
 
-    p = sub.add_parser("add", help="Add a subscription")
+    p = sub.add_parser("add", help="Add a subscription (optional -t tags)")
     p.add_argument("url")
-    p.set_defaults(func=lambda a: cmd_add(a.url))
+    p.add_argument("-t", "--tags", default="", help="Comma-separated tags, e.g. -t tech,news")
+    p.set_defaults(func=lambda a: cmd_add(a.url, a.tags))
 
     p = sub.add_parser("fetch", help="Fetch all enabled subscriptions")
     p.set_defaults(func=lambda a: cmd_fetch())
 
-    p = sub.add_parser("unread", help="List unread items")
-    p.add_argument("-l", "--limit", type=int, default=20)
-    p.set_defaults(func=lambda a: cmd_unread(a.limit))
+    p = sub.add_parser("tag", help="Set/replace tags on a feed (no -t shows current tags)")
+    p.add_argument("feed_id", type=int)
+    p.add_argument("-t", "--tags", default="", help="Comma-separated tags, e.g. -t tech,news")
+    p.set_defaults(func=lambda a: cmd_tag(a.feed_id, a.tags))
 
-    p = sub.add_parser("search", help="Full-text search")
+    p = sub.add_parser("tags", help="List all tags with feed counts")
+    p.set_defaults(func=lambda a: cmd_tags())
+
+    p = sub.add_parser("unread", help="List unread items (optional -t tag filter)")
+    p.add_argument("-l", "--limit", type=int, default=20)
+    p.add_argument("-t", "--tag", default=None, help="Only items from feeds with this tag")
+    p.set_defaults(func=lambda a: cmd_unread(a.limit, a.tag))
+
+    p = sub.add_parser("search", help="Full-text search (optional -t tag filter)")
     p.add_argument("query")
     p.add_argument("-l", "--limit", type=int, default=50)
-    p.set_defaults(func=lambda a: cmd_search(a.query, a.limit))
+    p.add_argument("-t", "--tag", default=None, help="Only results from feeds with this tag")
+    p.set_defaults(func=lambda a: cmd_search(a.query, a.limit, a.tag))
 
     p = sub.add_parser("markread", help="Mark as read (all unread by default)")
     p.add_argument("item_id", nargs="?", type=int, default=None)
     p.set_defaults(func=lambda a: cmd_markread(a.item_id))
 
-    p = sub.add_parser("list", help="List subscriptions")
-    p.set_defaults(func=lambda a: cmd_list())
+    p = sub.add_parser("list", help="List subscriptions (optional -t tag filter)")
+    p.add_argument("-t", "--tag", default=None, help="Only feeds with this tag")
+    p.set_defaults(func=lambda a: cmd_list(a.tag))
 
     p = sub.add_parser("remove", help="Remove a subscription (cascades to its items)")
     p.add_argument("feed_id", type=int)
