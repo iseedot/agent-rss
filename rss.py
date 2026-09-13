@@ -453,11 +453,13 @@ def _fetch(url: str, headers: dict[str, str]) -> tuple[bytes, dict[str, str]]:
         raise FeedURLError(f"Request failed: {e.reason}")
 
     body = resp.read(MAX_FEED_SIZE + 1)
-    resp_headers = dict(resp.headers.items())
+    # Normalize header keys to lowercase: upstream servers (e.g. Node-based
+    # ones) may send lowercase names, and lookups must not be case-sensitive.
+    resp_headers = {k.lower(): v for k, v in resp.headers.items()}
     resp.close()
     if len(body) > MAX_FEED_SIZE:
         raise FeedURLError(f"Feed exceeds size limit: {MAX_FEED_SIZE} bytes")
-    if resp_headers.get("Content-Encoding", "").lower() == "gzip":
+    if resp_headers.get("content-encoding", "").lower() == "gzip":
         try:
             body = gzip.decompress(body)
         except OSError as e:
@@ -515,7 +517,7 @@ def fetch_feed(feed: Feed) -> int:
     """Fetch a single feed; returns the number of new items"""
     if feed.id is None:
         return 0
-    headers = {"User-Agent": "pi-agent-rss/0.2.0", "Accept-Encoding": "gzip"}
+    headers = {"User-Agent": "pi-agent-rss/0.2.1", "Accept-Encoding": "gzip"}
     if feed.last_modified:
         headers["If-Modified-Since"] = feed.last_modified
     if feed.etag:
@@ -557,8 +559,8 @@ def fetch_feed(feed: Feed) -> int:
 
         update_fetch_status(
             feed.id, error=None,
-            last_modified=resp_headers.get("Last-Modified"),
-            etag=resp_headers.get("ETag"),
+            last_modified=resp_headers.get("last-modified"),
+            etag=resp_headers.get("etag"),
         )
         return new_count
 
