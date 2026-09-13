@@ -76,9 +76,11 @@ const rssTool = defineTool({
   label: "RSS News",
   description:
     "RSS tool: add a subscription (add), tag feeds for category filtering (tag/tags), " +
-    "fetch updates (fetch), list unread items (unread), full-text search (search), " +
-    "mark items as read (markread), manage subscriptions (list/remove). " +
-    "unread/search/list accept a tag filter to see only one category. " +
+    "fetch updates (fetch), list unread items (unread), recent items from a feed (recent), " +
+    "full-text search (search), mark items as read (markread), per-feed/per-tag stats (stats), " +
+    "manage subscriptions (list/remove). " +
+    "unread/search/list accept a tag or feed_id filter; markread accepts tag/older_than/before " +
+    "filters for batch marking (e.g. mark all unread older than 48h in one tag). " +
     "Data is stored in the plugin's data/rss.db by default (override with RSS_DB_PATH).",
   parameters: Type.Object({
     action: Type.Union([
@@ -87,9 +89,11 @@ const rssTool = defineTool({
       Type.Literal("tags", { description: "List all tags in use with feed counts" }),
       Type.Literal("fetch", { description: "Fetch all enabled subscriptions" }),
       Type.Literal("unread", { description: "List unread items (optional tag filter)" }),
-      Type.Literal("search", { description: "Full-text search; requires query (optional tag filter)" }),
-      Type.Literal("markread", { description: "Mark items as read (all unread, or one by item_id)" }),
+      Type.Literal("search", { description: "Full-text search; requires query (optional tag or feed_id filter)" }),
+      Type.Literal("recent", { description: "Recent items from a feed (feed_id), regardless of read state" }),
+      Type.Literal("markread", { description: "Mark as read: all, one item_id, or filtered by tag/older_than/before" }),
       Type.Literal("list", { description: "List subscriptions (optional tag filter)" }),
+      Type.Literal("stats", { description: "Per-feed and per-tag stats: item/unread counts, last item/fetch time, fetch errors" }),
       Type.Literal("remove", { description: "Remove a subscription; requires feed_id" }),
     ]),
     feed_url: Type.Optional(
@@ -99,7 +103,13 @@ const rssTool = defineTool({
       Type.String({ description: "Comma-separated tags, e.g. tech,news (actions add and tag)" }),
     ),
     tag: Type.Optional(
-      Type.String({ description: "Filter by tag/category (actions unread, search, list)" }),
+      Type.String({ description: "Filter by tag/category (actions unread, search, list, markread)" }),
+    ),
+    older_than: Type.Optional(
+      Type.Integer({ description: "Hours; markread only: mark unread items published more than N hours ago" }),
+    ),
+    before: Type.Optional(
+      Type.String({ description: "markread only: unix timestamp or ISO date; mark unread items published before it" }),
     ),
     query: Type.Optional(
       Type.String({ description: "Search keyword (required for action=search; supports FTS5 syntax)" }),
@@ -111,7 +121,7 @@ const rssTool = defineTool({
       Type.Integer({ description: "Item ID (optional for markread; all unread when omitted)" }),
     ),
     feed_id: Type.Optional(
-      Type.Integer({ description: "Feed ID (required for actions remove and tag)" }),
+      Type.Integer({ description: "Feed ID (required for remove and tag; filter for unread/search; recent)" }),
     ),
   }),
 
@@ -132,18 +142,27 @@ const rssTool = defineTool({
     } else if (params.action === "search") {
       if (!params.query) return { content: [{ type: "text", text: "❌ action=search requires query" }] };
       args.push(params.query);
-    } else if (params.action === "markread" && params.item_id != null) {
-      args.push(String(params.item_id));
+      if (params.tag) args.push("-t", params.tag);
+      if (params.feed_id != null) args.push("-f", String(params.feed_id));
+    } else if (params.action === "markread") {
+      if (params.item_id != null) {
+        args.push(String(params.item_id));
+      } else {
+        if (params.tag) args.push("-t", params.tag);
+        if (params.older_than != null) args.push("--older-than", String(params.older_than));
+        if (params.before) args.push("--before", params.before);
+      }
     } else if (params.action === "remove") {
       if (params.feed_id == null) return { content: [{ type: "text", text: "❌ action=remove requires feed_id" }] };
       args.push(String(params.feed_id));
+    } else if (params.action === "unread" || params.action === "list") {
+      if (params.tag) args.push("-t", params.tag);
+      if (params.action === "unread" && params.feed_id != null) args.push("-f", String(params.feed_id));
+    } else if (params.action === "recent") {
+      if (params.feed_id != null) args.push("-f", String(params.feed_id));
     }
 
-    if (params.tag && (params.action === "unread" || params.action === "search" || params.action === "list")) {
-      args.push("-t", params.tag);
-    }
-
-    if (params.limit != null && (params.action === "unread" || params.action === "search")) {
+    if (params.limit != null && (params.action === "unread" || params.action === "search" || params.action === "recent")) {
       args.push("-l", String(params.limit));
     }
 

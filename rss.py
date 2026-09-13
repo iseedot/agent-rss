@@ -6,9 +6,10 @@ Design:
 - Fixed database schema: rss_feeds / rss_items / rss_items_fts
 - Database defaults to <pi config dir>/rss-data/rss.db; override with RSS_DB_PATH
 
-Commands: add / fetch / unread / search / markread / list / remove / tag / tags
+Commands: add / fetch / unread / search / markread / list / remove / tag / tags / stats / recent
 Feeds carry comma-separated tags (rss_feeds.tags) for category filtering
-(unread/search/list accept -t to filter by tag).
+(unread/search/list accept -t to filter by tag). markread accepts tag/time
+filters for batch marking; stats reports per-feed and per-tag health.
 """
 from __future__ import annotations
 
@@ -445,7 +446,53 @@ def mark_all_read() -> int:
         conn.close()
 
 
-def search_items(query: str, limit: int = 50, tag: Optional[str] = None) -> list[Item]:
+def mark_read_filtered(tag: Optional[str] = None, older_than_hours: Optional[int] = None,
+                       before_ts: Optional[int] = None) -> int:
+    """Batch-mark unread items as read, restricted to feeds with tag, items
+    older than N hours, and/or items before a timestamp (all optional)."""
+    where, params = ["i.is_read = 0"], []
+    joins = ""
+    if tag:
+        joins = " JOIN rss_feeds f ON f.id = i.feed_id"
+        where.append(_tag_match_sql("f.tags"))
+        params.append(tag)
+    if older_than_hours is not None:
+        where.append("COALESCE(i.published, i.created_at) < ?")
+        params.append(int(time.time()) - older_than_hours * 3600)
+    if before_ts is not None:
+        where.append("COALESCE(i.published, i.created_at) < ?")
+        params.append(before_ts)
+    sql = (f"UPDATE rss_items SET is_read = 1 WHERE id IN "
+           f"(SELECT i.id FROM rss_items i{joins} WHERE {' AND '.join(where)})")
+    conn = get_conn()
+    try:
+        cur = conn.execute(sql, params)
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+def get_unread_count(tag: Optional[str] = None, feed_id: Optional[int] = None) -> int:
+    conn = get_conn()
+    try:
+        where, params = ["i.is_read = 0"], []
+        if tag:
+            where.append(_tag_match_sql("f.tags"))
+            params.append(tag)
+        if feed_id:
+            where.append("i.feed_id = ?")
+            params.append(feed_id)
+        sql = ("SELECT COUNT(*) AS c FROM rss_items i "
+               "JOIN rss_feeds f ON f.id = i.feed_id WHERE " + " AND ".join(where))
+        row = conn.execute(sql, params).fetchone()
+        return row["c"]
+    finally:
+        conn.close()
+
+
+def search_items(query: str, limit: int = 50, tag: Optional[str] = None,
+                 feed_id: Optional[int] = None) -> list[Item]:
     query = (query or "").strip()[:MAX_SEARCH_QUERY]
     if not query:
         return []
@@ -458,6 +505,9 @@ def search_items(query: str, limit: int = 50, tag: Optional[str] = None) -> list
     if tag:
         sql += " AND " + _tag_match_sql("f.tags")
         args.insert(1, tag)
+    if feed_id:
+        sql += " AND i.feed_id = ?"
+        args.insert(1, feed_id)
     sql += " ORDER BY i.published DESC LIMIT ?"
     conn = get_conn()
     try:
@@ -470,6 +520,34 @@ def search_items(query: str, limit: int = 50, tag: Optional[str] = None) -> list
         return []
     finally:
         conn.close()
+
+
+# ---- stats ----
+
+def feed_stats() -> list[dict]:
+    """Per-feed aggregates: item counts, unread, last item/fetch time, fetch error."""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT f.id, f.url, f.title, f.tags, f.enabled, f.last_fetch_time, f.fetch_error,
+                      COUNT(i.id) AS total_items,
+                      SUM(CASE WHEN i.is_read = 0 THEN 1 ELSE 0 END) AS unread_items,
+                      MAX(i.published) AS last_item_time
+               FROM rss_feeds f LEFT JOIN rss_items i ON i.feed_id = f.id
+               GROUP BY f.id ORDER BY f.id"""
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def _fmt_ts(ts) -> str:
+    if not ts:
+        return "-"
+    try:
+        return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return "-"
 
 
 # ---------------------------------------------------------------------------
@@ -561,7 +639,7 @@ def fetch_feed(feed: Feed) -> int:
     """Fetch a single feed; returns the number of new items"""
     if feed.id is None:
         return 0
-    headers = {"User-Agent": "pi-agent-rss/0.3.0", "Accept-Encoding": "gzip"}
+    headers = {"User-Agent": "pi-agent-rss/0.4.0", "Accept-Encoding": "gzip"}
     if feed.last_modified:
         headers["If-Modified-Since"] = feed.last_modified
     if feed.etag:
@@ -712,24 +790,45 @@ def cmd_fetch() -> str:
     return "\n".join(lines)
 
 
-def cmd_unread(limit: int, tag: Optional[str] = None) -> str:
-    items = get_items(unread_only=True, limit=limit, tag=tag)
+def cmd_unread(limit: int, tag: Optional[str] = None, feed_id: Optional[int] = None) -> str:
+    items = get_items(unread_only=True, limit=limit, tag=tag, feed_id=feed_id)
+    total = get_unread_count(tag=tag, feed_id=feed_id)
     if not items:
-        return f"No unread items{' with tag ' + tag if tag else ''}"
-    header = f"📰 Unread items ({len(items)})" + (f" tagged '{tag}'" if tag else "")
+        return f"No unread items{' with tag ' + tag if tag else ''}{' from feed ' + str(feed_id) if feed_id else ''}"
+    header = f"📰 Unread items ({len(items)} shown / {total} total)"
+    if tag:
+        header += f" tagged '{tag}'"
+    if feed_id:
+        header += f" from feed {feed_id}"
     return "\n".join([header, ""] + _pretty_items(items)
                      + ["💡 Tip: use markread after reading"])
 
 
-def cmd_search(query: str, limit: int, tag: Optional[str] = None) -> str:
-    items = search_items(query, limit=limit, tag=tag)
+def cmd_search(query: str, limit: int, tag: Optional[str] = None, feed_id: Optional[int] = None) -> str:
+    items = search_items(query, limit=limit, tag=tag, feed_id=feed_id)
     if not items:
         return f"No items found for '{query}'"
-    header = f"🔍 Search results: '{query}' ({len(items)})" + (f" tagged '{tag}'" if tag else "")
+    header = f"🔍 Search results: '{query}' ({len(items)})"
+    if tag:
+        header += f" tagged '{tag}'"
+    if feed_id:
+        header += f" from feed {feed_id}"
     return "\n".join([header, ""] + _pretty_items(items))
 
 
-def cmd_markread(item_id: Optional[int]) -> str:
+def cmd_recent(feed_id: Optional[int], limit: int) -> str:
+    """Recent items from one feed (or all), regardless of read state."""
+    if feed_id is not None and not get_feed(feed_id):
+        return f"❌ No feed with ID {feed_id}"
+    items = get_items(unread_only=False, limit=limit, feed_id=feed_id)
+    if not items:
+        return f"No items{' for feed ' + str(feed_id) if feed_id else ''}"
+    header = f"🕒 Recent items ({len(items)})" + (f" from feed {feed_id}" if feed_id else "")
+    return "\n".join([header, ""] + _pretty_items(items))
+
+
+def cmd_markread(item_id: Optional[int], tag: Optional[str] = None,
+                 older_than: Optional[int] = None, before: Optional[str] = None) -> str:
     if item_id is not None:
         conn = get_conn()
         try:
@@ -740,8 +839,64 @@ def cmd_markread(item_id: Optional[int]) -> str:
             return f"❌ No item with ID {item_id}"
         mark_as_read(item_id)
         return f"✅ Marked item {item_id} as read"
-    count = mark_all_read()
-    return f"✅ Marked {count} item(s) as read" if count else "No unread items to mark"
+
+    filters: list[str] = []
+    before_ts: Optional[int] = None
+    if tag:
+        filters.append(f"tag '{tag}'")
+    if older_than:
+        filters.append(f"older than {older_than}h")
+    if before:
+        before_ts = _parse_ts(before)
+        if before_ts is None:
+            return (f"❌ Cannot parse time: '{before}'. Use a unix timestamp or ISO date, "
+                    f"e.g. 1757700000 or 2026-09-10 or 2026-09-10T12:00")
+        filters.append(f"before {_fmt_ts(before_ts)}")
+
+    if not filters:
+        count = mark_all_read()
+        return f"✅ Marked {count} item(s) as read" if count else "No unread items to mark"
+
+    count = mark_read_filtered(tag=tag, older_than_hours=older_than, before_ts=before_ts)
+    return f"✅ Marked {count} unread item(s) as read ({', '.join(filters)})"
+
+
+def cmd_stats() -> str:
+    rows = feed_stats()
+    if not rows:
+        return "No subscriptions"
+    total_unread = sum(int(r["unread_items"] or 0) for r in rows)
+    failed = sum(1 for r in rows if r["fetch_error"])
+    lines = [
+        f"📊 RSS stats",
+        f"Feeds: {len(rows)} | Unread total: {total_unread} | With errors: {failed}",
+        "",
+    ]
+    for r in rows:
+        title = r["title"] or "(not fetched yet)"
+        tags = f"  🏷️ {r['tags']}" if r["tags"] else ""
+        status = f"⚠️ {r['fetch_error']}" if r["fetch_error"] else "✅"
+        lines.append(f"ID {r['id']} {title}{tags}")
+        lines.append(
+            f"  items: {r['total_items'] or 0} | unread: {r['unread_items'] or 0} | "
+            f"last item: {_fmt_ts(r['last_item_time'])} | "
+            f"last fetch: {_fmt_ts(r['last_fetch_time'])} | {status}"
+        )
+    tag_counts: dict[str, dict] = {}
+    for r in rows:
+        for t in (r["tags"] or "").split(","):
+            t = t.strip()
+            if not t:
+                continue
+            agg = tag_counts.setdefault(t, {"feeds": 0, "items": 0, "unread": 0})
+            agg["feeds"] += 1
+            agg["items"] += int(r["total_items"] or 0)
+            agg["unread"] += int(r["unread_items"] or 0)
+    if tag_counts:
+        lines += ["", "🏷️ By tag"]
+        for t, agg in sorted(tag_counts.items(), key=lambda kv: (-kv[1]["unread"], kv[0])):
+            lines.append(f"  {t}: {agg['items']} items, {agg['unread']} unread ({agg['feeds']} feed(s))")
+    return "\n".join(lines)
 
 
 def cmd_list(tag: Optional[str] = None) -> str:
@@ -803,6 +958,20 @@ def cmd_remove(feed_id: int) -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _parse_ts(s: str) -> Optional[int]:
+    """Parse a unix timestamp or ISO date/datetime into a unix timestamp."""
+    s = s.strip()
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    try:
+        dt = datetime.fromisoformat(s.replace("T", " "))
+        return int(dt.timestamp())
+    except ValueError:
+        return None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rss.py", description="pi-agent-rss aggregator")
     sub = parser.add_subparsers(dest="action", required=True)
@@ -823,20 +992,35 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("tags", help="List all tags with feed counts")
     p.set_defaults(func=lambda a: cmd_tags())
 
-    p = sub.add_parser("unread", help="List unread items (optional -t tag filter)")
+    p = sub.add_parser("unread", help="List unread items (optional -t tag / -f feed filters)")
     p.add_argument("-l", "--limit", type=int, default=20)
     p.add_argument("-t", "--tag", default=None, help="Only items from feeds with this tag")
-    p.set_defaults(func=lambda a: cmd_unread(a.limit, a.tag))
+    p.add_argument("-f", "--feed-id", type=int, default=None, help="Only items from this feed")
+    p.set_defaults(func=lambda a: cmd_unread(a.limit, a.tag, a.feed_id))
 
-    p = sub.add_parser("search", help="Full-text search (optional -t tag filter)")
+    p = sub.add_parser("search", help="Full-text search (optional -t tag / -f feed filters)")
     p.add_argument("query")
     p.add_argument("-l", "--limit", type=int, default=50)
     p.add_argument("-t", "--tag", default=None, help="Only results from feeds with this tag")
-    p.set_defaults(func=lambda a: cmd_search(a.query, a.limit, a.tag))
+    p.add_argument("-f", "--feed-id", type=int, default=None, help="Only results from this feed")
+    p.set_defaults(func=lambda a: cmd_search(a.query, a.limit, a.tag, a.feed_id))
 
-    p = sub.add_parser("markread", help="Mark as read (all unread by default)")
+    p = sub.add_parser("recent", help="Recent items from a feed (or all), regardless of read state")
+    p.add_argument("-f", "--feed-id", type=int, default=None)
+    p.add_argument("-l", "--limit", type=int, default=20)
+    p.set_defaults(func=lambda a: cmd_recent(a.feed_id, a.limit))
+
+    p = sub.add_parser("markread", help="Mark as read: all, one item, or filtered by tag/time")
     p.add_argument("item_id", nargs="?", type=int, default=None)
-    p.set_defaults(func=lambda a: cmd_markread(a.item_id))
+    p.add_argument("-t", "--tag", default=None, help="Only items from feeds with this tag")
+    p.add_argument("--older-than", type=int, default=None, metavar="HOURS",
+                   help="Only unread items published more than HOURS hours ago")
+    p.add_argument("--before", default=None, metavar="TS",
+                   help="Only unread items before a unix timestamp or ISO date")
+    p.set_defaults(func=lambda a: cmd_markread(a.item_id, a.tag, a.older_than, a.before))
+
+    p = sub.add_parser("stats", help="Per-feed and per-tag stats (item/unread counts, fetch health)")
+    p.set_defaults(func=lambda a: cmd_stats())
 
     p = sub.add_parser("list", help="List subscriptions (optional -t tag filter)")
     p.add_argument("-t", "--tag", default=None, help="Only feeds with this tag")

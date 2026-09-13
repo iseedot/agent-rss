@@ -78,8 +78,13 @@ Once installed, just tell pi: "add subscription <feed URL>" and the plugin will 
 Add a feed:       rss add https://example.com/feed.xml
 Fetch updates:    rss fetch
 Read unread:      rss unread (default 20 items, adjust with limit)
+By category:      rss unread -t tech   (also works for search and list)
+By single feed:   rss recent -f 1  /  rss unread -f 1  /  rss search kw -f 1
 Search history:   rss search <keyword> (FTS5 full-text search)
+Tag a feed:       rss tag <feed_id> -t tech,news
 Mark as read:     rss markread (all unread); rss markread <item_id> (single item)
+Batch mark read:  rss markread -t tech --older-than 48  (tag + time filters)
+Feed stats:       rss stats  (counts, last item/fetch, fetch errors, by tag)
 Manage feeds:     rss list / rss remove <feed_id>
 ```
 
