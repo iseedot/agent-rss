@@ -87,7 +87,7 @@ Manage feeds:     rss list / rss remove <feed_id>
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `RSS_DB_PATH` | Database file path (for migrating an old database or long-term storage) | plugin dir `data/rss.db` |
+| `RSS_DB_PATH` | Database file path (explicit override) | `<pi config dir>/rss-data/rss.db` — e.g. `~/.pi/agent/rss-data/rss.db` |
 | `RSS_TRUSTED_PRIVATE_ORIGINS` | Comma-separated private origins allowed to be fetched (e.g. `http://nas.local:8000`) | empty (private IPs blocked by default; SSRF protection) |
 | `RSS_AUTO_FETCH_MINUTES` | Scheduled fetch interval in minutes; new items are pushed to the agent | empty (disabled) |
 | `RSS_PY_PYTHON` | Python interpreter path (only needed when using a venv or a non-default python3) | `python3` |
@@ -95,8 +95,8 @@ Manage feeds:     rss list / rss remove <feed_id>
 ## Data notes
 
 - The database is SQLite (tables: `rss_feeds` / `rss_items` / `rss_items_fts`).
-- To migrate machines: copy the whole plugin directory; to keep read state,
-  copy the database file along with it, or point `RSS_DB_PATH` at the copy.
-- ⚠️ If installed via `pi install git:...`: `pi update` resets the plugin
-  directory, so **set `RSS_DB_PATH`** (e.g. `~/.pi/rss-data/rss.db`) to keep
-  your data, otherwise read state and subscriptions are lost on update.
+- The database lives **outside the plugin directory** (default: `<pi config dir>/rss-data/rss.db`),
+  so package updates (`pi update`) never wipe subscriptions or read state.
+- Old plugin-dir databases (`data/rss.db`) are migrated automatically on first run.
+- To migrate machines: copy the plugin directory and the database file, or point
+  `RSS_DB_PATH` at your copy.

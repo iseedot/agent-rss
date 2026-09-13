@@ -51,13 +51,25 @@ except ImportError:
 MODULE_DIR = Path(__file__).resolve().parent
 
 
+def get_pi_config_dir() -> Path:
+    """pi config directory: $PI_CODING_AGENT_DIR, else ~/.pi/agent"""
+    override = os.getenv("PI_CODING_AGENT_DIR", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return Path.home() / ".pi" / "agent"
+
+
 def get_db_path() -> Path:
-    """Database path: $RSS_DB_PATH if set, else <this file dir>/data/rss.db"""
+    """Database path: $RSS_DB_PATH if set, else <pi config dir>/rss-data/rss.db.
+
+    Lives outside the plugin directory on purpose: plugin directories are
+    reset by package updates (git installs), this location is stable.
+    """
     override = os.getenv("RSS_DB_PATH", "").strip()
     if override:
         p = Path(override).expanduser().resolve()
     else:
-        p = MODULE_DIR / "data" / "rss.db"
+        p = get_pi_config_dir() / "rss-data" / "rss.db"
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -158,7 +170,24 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
+def migrate_legacy_db():
+    """One-time migration: move plugin-dir data/rss.db to the new stable location.
+
+    Only runs when RSS_DB_PATH is unset (explicit override means the user
+    manages the location) and the legacy file exists.
+    """
+    if os.getenv("RSS_DB_PATH", "").strip():
+        return
+    legacy = MODULE_DIR / "data" / "rss.db"
+    if legacy.exists() and not DB_PATH.exists():
+        import shutil
+
+        shutil.copy2(legacy, DB_PATH)
+        print(f"ℹ️ Migrated database from {legacy} to {DB_PATH}")
+
+
 def init_db():
+    migrate_legacy_db()
     conn = get_conn()
     try:
         conn.executescript("".join(SCHEMAS))

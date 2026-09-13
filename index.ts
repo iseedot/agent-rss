@@ -6,6 +6,8 @@
  *   rss.py      Single-file Python backend (stdlib + feedparser only)
  *   INSTALL.md  AI-readable setup guide (referenced by the environment gate)
  *   data/       Runtime data directory (rss.db; override with RSS_DB_PATH)
+ * Note: the database defaults to <pi config dir>/rss-data/rss.db (outside the
+ * plugin directory) so package updates never wipe it.
  *
  * Tools: add / fetch / unread / search / markread / list / remove
  * Optional scheduling: set RSS_AUTO_FETCH_MINUTES (e.g. 60) to fetch
@@ -52,18 +54,6 @@ async function checkEnv(): Promise<string | null> {
       `See the setup guide: ${INSTALL_MD}`
     );
   }
-}
-
-/** Hint for git-installed packages: pi update resets the plugin directory */
-function gitModeHint(): string {
-  const isGitInstall = MODULE_DIR.includes(`${path.sep}git${path.sep}`);
-  const hasDbOverride = !!process.env.RSS_DB_PATH;
-  if (!isGitInstall || hasDbOverride) return "";
-  return (
-    "\nℹ️ Note: installed via git — `pi update` may reset the plugin directory and " +
-    "lose data.\nSet the environment variable RSS_DB_PATH (e.g. ~/.pi/rss-data/rss.db) " +
-    "to persist subscriptions and read state."
-  );
 }
 
 /** Run rss.py and return its output text */
@@ -138,7 +128,6 @@ const rssTool = defineTool({
     }
 
     let text = await runPy(...args);
-    if (params.action === "fetch") text += gitModeHint();
     return { content: [{ type: "text", text }] };
   },
 });
