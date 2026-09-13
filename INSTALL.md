@@ -88,7 +88,6 @@ Manage feeds:     rss list / rss remove <feed_id>
 | Variable | Purpose | Default |
 |---|---|---|
 | `RSS_DB_PATH` | Database file path (explicit override) | `<pi config dir>/rss-data/rss.db` — e.g. `~/.pi/agent/rss-data/rss.db` |
-| `RSS_TRUSTED_PRIVATE_ORIGINS` | Comma-separated private origins allowed to be fetched (e.g. `http://nas.local:8000`) | empty (private IPs blocked by default; SSRF protection) |
 | `RSS_AUTO_FETCH_MINUTES` | Scheduled fetch interval in minutes; new items are pushed to the agent | empty (disabled) |
 | `RSS_PY_PYTHON` | Python interpreter path (only needed when using a venv or a non-default python3) | `python3` |
 

@@ -4,9 +4,7 @@
 Design:
 - Depends only on the Python standard library + feedparser (pure Python, no compilation)
 - Fixed database schema: rss_feeds / rss_items / rss_items_fts
-- Database defaults to ./data/rss.db next to this file; override with RSS_DB_PATH
-- Safety: private IPs rejected (SSRF protection), per-hop redirect validation,
-  XXE sanitization, 10 MB size cap
+- Database defaults to <pi config dir>/rss-data/rss.db; override with RSS_DB_PATH
 
 Commands: add / fetch / unread / search / markread / list / remove
 """
@@ -16,11 +14,9 @@ import argparse
 import gzip
 import hashlib
 import html
-import ipaddress
 import json
 import os
 import re
-import socket
 import sqlite3
 import sys
 import time
@@ -78,7 +74,6 @@ DB_PATH = get_db_path()
 
 MAX_FEED_SIZE = 10 * 1024 * 1024        # 10 MB
 FETCH_TIMEOUT = 30                      # seconds
-MAX_REDIRECTS = 5
 MAX_ITEM_LIMIT = 1000
 MAX_SEARCH_QUERY = 500
 
@@ -434,144 +429,41 @@ def search_items(query: str, limit: int = 50) -> list[Item]:
 
 
 # ---------------------------------------------------------------------------
-# Safety layer (reduced SSRF protection: private IP rejection + allowlist +
-# per-hop redirect validation)
-# ---------------------------------------------------------------------------
-
-def get_trusted_private_origins() -> list[str]:
-    return [u.strip() for u in os.getenv("RSS_TRUSTED_PRIVATE_ORIGINS", "").split(",") if u.strip()]
-
-
-def _url_origin(url: str) -> Optional[tuple[str, str, int]]:
-    try:
-        parsed = urllib.parse.urlparse(url)
-        hostname = parsed.hostname
-        if parsed.scheme not in ("http", "https") or not hostname:
-            return None
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    except (ValueError, TypeError):
-        return None
-    return parsed.scheme, hostname.casefold(), port
-
-
-def _is_trusted(url: str, trusted_origins: list[str]) -> bool:
-    target = _url_origin(url)
-    if target is None:
-        return False
-    for configured in trusted_origins:
-        try:
-            parsed = urllib.parse.urlparse(configured)
-        except (ValueError, TypeError):
-            continue
-        if parsed.username or parsed.password:
-            continue
-        if parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment:
-            continue
-        if _url_origin(configured) == target:
-            return True
-    return False
-
-
-def _resolve_host(hostname: str) -> list[str]:
-    """Resolve all IPs of a hostname; raises OSError on failure"""
-    infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
-    return sorted({info[4][0] for info in infos})
-
-
-def _is_private_ip(ip_str: str) -> bool:
-    try:
-        ip = ipaddress.ip_address(ip_str)
-    except ValueError:
-        return True  # unparseable -> treat as unsafe
-    return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast
-
-
-class FeedURLBlockedError(ValueError):
-    pass
-
-
-def validate_url(url: str, trusted_origins: list[str]) -> str:
-    """Validate a target URL; returns the hostname, or raises FeedURLBlockedError"""
-    origin = _url_origin(url)
-    if origin is None:
-        raise FeedURLBlockedError(f"Only http/https URLs are supported: {url}")
-    scheme, hostname, _ = origin
-
-    if _is_trusted(url, trusted_origins):
-        return hostname  # allowlisted: private targets permitted
-
-    try:
-        addresses = _resolve_host(hostname)
-    except OSError as e:
-        raise FeedURLBlockedError(f"DNS resolution failed for {hostname}: {e}")
-
-    private_ips = [a for a in addresses if _is_private_ip(a)]
-    if private_ips:
-        raise FeedURLBlockedError(
-            f"Blocked private/internal address (SSRF protection): {hostname} -> {','.join(private_ips)}"
-            f"; to allow it, set RSS_TRUSTED_PRIVATE_ORIGINS")
-    return hostname
-
-
-# ---------------------------------------------------------------------------
 # Fetch layer (stdlib urllib, serial)
 # ---------------------------------------------------------------------------
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+_OPENER = urllib.request.build_opener()
 
 
-_OPENER = urllib.request.build_opener(_NoRedirect)
-_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+class FeedURLError(Exception):
+    """Fetch-level error with a user-readable message."""
 
 
-def _fetch_with_safe_redirects(url: str, headers: dict[str, str]) -> tuple[bytes, dict[str, str]]:
-    """Fetch content with per-hop redirect validation (max 5 hops); returns (body, headers)"""
-    trusted = get_trusted_private_origins()
-    current_url = url
+def _fetch(url: str, headers: dict[str, str]) -> tuple[bytes, dict[str, str]]:
+    """Fetch content (redirects followed by urllib); returns (body, headers) or
+    raises FeedURLError with a user-readable message."""
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        resp = _OPENER.open(req, timeout=FETCH_TIMEOUT)
+    except urllib.error.HTTPError as e:
+        if e.code == 304:
+            return b"", {"status": "304"}
+        raise FeedURLError(f"HTTP {e.code}")
+    except urllib.error.URLError as e:
+        raise FeedURLError(f"Request failed: {e.reason}")
 
-    for _ in range(MAX_REDIRECTS + 1):
-        validate_url(current_url, trusted)
-        req = urllib.request.Request(current_url, headers=headers)
+    body = resp.read(MAX_FEED_SIZE + 1)
+    resp_headers = dict(resp.headers.items())
+    resp.close()
+    if len(body) > MAX_FEED_SIZE:
+        raise FeedURLError(f"Feed exceeds size limit: {MAX_FEED_SIZE} bytes")
+    if resp_headers.get("Content-Encoding", "").lower() == "gzip":
         try:
-            resp = _OPENER.open(req, timeout=FETCH_TIMEOUT)
-        except urllib.error.HTTPError as e:
-            if e.code in _REDIRECT_STATUSES:
-                location = e.headers.get("Location")
-                if not location:
-                    return b"", {"status": str(e.code)}
-                current_url = urllib.parse.urljoin(current_url, location)
-                continue
-            if e.code == 304:
-                return b"", {"status": "304"}
-            raise FeedURLBlockedError(f"HTTP {e.code}")
-        except urllib.error.URLError as e:
-            raise FeedURLBlockedError(f"Request failed: {e.reason}")
-
-        status = getattr(resp, "status", 200)
-        if status in _REDIRECT_STATUSES:
-            location = resp.headers.get("Location")
-            resp.close()
-            if not location:
-                return b"", {"status": str(status)}
-            current_url = urllib.parse.urljoin(current_url, location)
-            continue
-
-        body = resp.read(MAX_FEED_SIZE + 1)
-        resp_headers = dict(resp.headers.items())
-        resp.close()
-        if len(body) > MAX_FEED_SIZE:
-            raise FeedURLBlockedError(f"Feed exceeds size limit: {MAX_FEED_SIZE} bytes")
-        if resp_headers.get("Content-Encoding", "").lower() == "gzip":
-            try:
-                body = gzip.decompress(body)
-            except OSError as e:
-                raise FeedURLBlockedError(f"gzip decompression failed: {e}")
-        resp_headers["status"] = str(status)
-        return body, resp_headers
-
-    raise FeedURLBlockedError(f"Too many redirects ({MAX_REDIRECTS})")
+            body = gzip.decompress(body)
+        except OSError as e:
+            raise FeedURLError(f"gzip decompression failed: {e}")
+    resp_headers["status"] = str(getattr(resp, "status", 200))
+    return body, resp_headers
 
 
 def _parse_feed_safe(content: bytes) -> feedparser.FeedParserDict:
@@ -623,14 +515,14 @@ def fetch_feed(feed: Feed) -> int:
     """Fetch a single feed; returns the number of new items"""
     if feed.id is None:
         return 0
-    headers = {"User-Agent": "pi-agent-rss/0.1.0", "Accept-Encoding": "gzip"}
+    headers = {"User-Agent": "pi-agent-rss/0.2.0", "Accept-Encoding": "gzip"}
     if feed.last_modified:
         headers["If-Modified-Since"] = feed.last_modified
     if feed.etag:
         headers["If-None-Match"] = feed.etag
 
     try:
-        body, resp_headers = _fetch_with_safe_redirects(feed.url, headers)
+        body, resp_headers = _fetch(feed.url, headers)
         status = resp_headers.get("status", "200")
 
         if status == "304":
@@ -670,8 +562,8 @@ def fetch_feed(feed: Feed) -> int:
         )
         return new_count
 
-    except FeedURLBlockedError as e:
-        update_fetch_status(feed.id, error=f"URL validation failed: {e}")
+    except FeedURLError as e:
+        update_fetch_status(feed.id, error=str(e))
         return 0
     except Exception as e:
         update_fetch_status(feed.id, error=str(e))
@@ -741,10 +633,6 @@ def _pretty_items(items: list[Item]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def cmd_add(url: str) -> str:
-    try:
-        validate_url(url, get_trusted_private_origins())
-    except FeedURLBlockedError as e:
-        return f"❌ Add failed: {e}"
     feed_id = add_feed(url)
     return f"✅ Feed added\nFeed ID: {feed_id}\nURL: {url}"
 

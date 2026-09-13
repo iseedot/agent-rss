@@ -43,7 +43,6 @@ new items to the agent automatically.
 
 - **Minimal dependencies**: Python side uses only `feedparser` (pure Python), everything else is stdlib; pi side has no npm dependencies.
 - **Fixed schema**: `rss_feeds` / `rss_items` / `rss_items_fts` (FTS5 full-text search), stable and documented.
-- **Safety defaults**: private IPs rejected (SSRF protection), per-hop redirect validation, XXE sanitization, 10 MB cap.
 - **Portable data**: the database defaults to `<pi config dir>/rss-data/rss.db`
   (outside the plugin directory, so package updates never wipe it); set `RSS_DB_PATH`
   to point at any SQLite file to reuse an existing database.
