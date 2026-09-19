@@ -1,6 +1,6 @@
 {
   "name": "pi-agent-rss",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "license": "MIT",
   "type": "module",
   "description": "RSS aggregation plugin: add/fetch/unread/search/markread/list/remove, feed tags for category filtering, optional scheduled fetch",
