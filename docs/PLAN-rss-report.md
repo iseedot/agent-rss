@@ -443,7 +443,7 @@ paseo schedule create --cron "0 21 * * *" --timezone Asia/Shanghai \
 | `RSS_SKIP_KEYWORDS` | 内置体育娱乐词 | 标题/摘要过滤（真机无 skip 类 tag） |
 | `RSS_OPINION_HINTS` | `@` / `财新` 等 | 观点源 title 匹配提示（可选，jev 仍会独立判定 kind） |
 | `RSS_SKIP_KEYWORDS` | 内置体育娱乐词 | 标题/摘要过滤 |
-| `RSS_AUTO_FETCH_MINUTES` | `0` | 关插件内定时 |
+| ~~`RSS_AUTO_FETCH_MINUTES`~~ | — | **已移除**：插件内定时抓取删除，paseo 是唯一时钟 |
 
 一次性准备：`rss manage {op:"tags"}` 查现有 tag → 配映射；建报告目录；
 `paseo schedule run-once <id>` 全链路验证。
