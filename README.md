@@ -32,6 +32,10 @@ On first use have the AI read `INSTALL.md` (python3 + feedparser).
 `brief` returns `next_steps`; the scheduled prompt should tell the model to use only
 these three calls (see `prompts/rss-report.md`).
 
+Facts-section format: only `- ` list lines are counted as facts; `**小标题**` / `### 小标题`
+headings are grouping-only and never enter the header counts or the ledger. Prose lines
+without a bullet are reported as structure violations by `qa`/`commit`.
+
 ### Why the pipeline exists
 
 - The model never reads raw feed dumps: only the curated payload enters context.
@@ -74,7 +78,7 @@ If the score reports `NOT trustworthy`, raise `RSS_JE_V_SKIP_CONF` / `RSS_JE_V_N
 
 - DB: `<pi config dir>/rss-data/rss.db` (override `RSS_DB_PATH`).
 - Tables: `rss_feeds` / `rss_items` / `rss_items_fts` plus `rss_ledger_facts`,
-  `rss_ledger_opinions`, `rss_runs`, `rss_state` (auto-migrated on first run).
+  `rss_ledger_opinions`, `rss_runs` (auto-migrated on first run).
 - Reports: `RSS_REPORT_DIR` (default `~/Chat/rss/`), filenames `MM-DD_hh.md` in Beijing time.
 - Tags live in `rss_feeds.tags` and are used as topical hints (真机: 技术/财经/资讯/AI科技).
 
@@ -111,7 +115,7 @@ provider uses it for `modelRegistry.classify()`. Keys never go into argv, URLs, 
 | `RSS_BRIEF_DEADLINE_MS` | 150000 | triage time budget per brief |
 | `RSS_QA_DEADLINE_MS` | 120000 | lint/verification time budget per qa |
 | `RSS_VERIFY_BUDGET` | 4 | hard web-verification cap per run |
-| `RSS_OPINION_RETIRE_RUNS` | 8 | retire opinions not seen for N runs |
+| `RSS_OPINION_RETIRE_RUNS` | 8 | retire opinions not seen for N periods (one period = one schedule slot) |
 | `RSS_CALIBRATION_FILE` | `<agent-dir>/rss-plugin/calibration.json` | calibrate file
 
 ## License

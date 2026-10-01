@@ -93,7 +93,7 @@ function runPy(
   });
 }
 
-type Envelope = { ok: boolean; action: string; data: any; error?: string | null };
+type Envelope = { ok: boolean; action: string; data: any; error?: string | null; text?: string | null };
 
 /** Run rss.py with --json and parse the envelope */
 async function runPyJson(args: string[], stdin?: string, timeoutMs?: number): Promise<Envelope> {
@@ -323,19 +323,21 @@ const RELATION_HINTS: Record<string, string> = {
   na: "",
 };
 
-async function runJevTriage(
-  ctx: ClassifierCtx,
-  items: TriageInput[],
-  ledger: LedgerInput,
-  deadlineMs: number,
-): Promise<{
+type TriageResult = {
   annotations: TriageAnnotation[];
   mode: "jev" | "partial" | "heuristic";
   model?: string;
   reason?: string;
   batches: number;
   failures: number;
-}> {
+};
+
+async function runJevTriage(
+  ctx: ClassifierCtx,
+  items: TriageInput[],
+  ledger: LedgerInput,
+  deadlineMs: number,
+): Promise<TriageResult> {
   const resolved = resolveJevModel(ctx);
   if (!resolved.model) {
     return { annotations: [], mode: "heuristic", reason: resolved.reason, batches: 0, failures: 0 };
@@ -1001,7 +1003,18 @@ const rssTool = defineTool({
         const data = brief.data as any;
         const deadlineMs = clampInt(process.env.RSS_BRIEF_DEADLINE_MS, 150_000, 10_000, 600_000);
         const triageTargets = (data?.items ?? []).filter((it: any) => !it.is_skipped);
-        const triage = await runJevTriage(ctx, triageTargets, data?.ledger ?? {}, deadlineMs);
+        let triage: TriageResult;
+        try {
+          triage = await runJevTriage(ctx, triageTargets, data?.ledger ?? {}, deadlineMs);
+        } catch (err: any) {
+          triage = {
+            annotations: [],
+            mode: "heuristic",
+            reason: `classifier error: ${err?.message ?? err}`,
+            batches: 0,
+            failures: 0,
+          };
+        }
         if (triage.annotations.length) {
           const ann = await runPyJson(["annotate", "--json"], JSON.stringify(triage.annotations));
           if (!ann.ok) console.error(`[rss] annotate failed: ${ann.error}`);
@@ -1038,9 +1051,24 @@ const rssTool = defineTool({
         const data = check.data as any;
         const violations: any[] = [...(data?.violations ?? [])];
         const deadlineMs = clampInt(process.env.RSS_QA_DEADLINE_MS, 120_000, 10_000, 600_000);
-        const lint = await runJevLint(ctx, params.draft, deadlineMs);
+        let lint: Awaited<ReturnType<typeof runJevLint>>;
+        try {
+          lint = await runJevLint(ctx, params.draft, deadlineMs);
+        } catch (err: any) {
+          lint = { violations: [], used: false, reason: `classifier error: ${err?.message ?? err}` };
+        }
         violations.push(...lint.violations);
-        const verification = await runVerification(ctx, params.draft);
+        let verification: Awaited<ReturnType<typeof runVerification>>;
+        try {
+          verification = await runVerification(ctx, params.draft);
+        } catch (err: any) {
+          verification = {
+            entries: [],
+            used: 0,
+            budget: clampInt(process.env.RSS_VERIFY_BUDGET, 4, 0, 8),
+            unavailable: true,
+          };
+        }
         pendingVerifyUsed = verification.used;
 
         data.violations = violations;
@@ -1109,15 +1137,26 @@ const rssTool = defineTool({
         const file = calibrationFile();
         if (op === "sample") {
           const n = params.max ?? 50;
-          const sample = await runPyJson(["sample", "--json", "--n", String(n), "--unread"]);
+          let sample = await runPyJson(["sample", "--json", "--n", String(n), "--unread"]);
           if (!sample.ok) return errResult("calibrate", `❌ sample failed: ${sample.error ?? "unknown"}`);
-          const items = sample.data?.items ?? [];
-          const triage = await runJevTriage(
-            ctx,
-            items,
-            { prev_facts: [], unconfirmed: [], active_opinions: [] },
-            clampInt(process.env.RSS_BRIEF_DEADLINE_MS, 150_000, 10_000, 600_000),
-          );
+          let items = sample.data?.items ?? [];
+          if (!items.length) {
+            // After a commit everything is read; fall back to a random sample of the whole DB.
+            sample = await runPyJson(["sample", "--json", "--n", String(n)]);
+            if (!sample.ok) return errResult("calibrate", `❌ sample failed: ${sample.error ?? "unknown"}`);
+            items = sample.data?.items ?? [];
+          }
+          let triage: TriageResult;
+          try {
+            triage = await runJevTriage(
+              ctx,
+              items,
+              { prev_facts: [], unconfirmed: [], active_opinions: [] },
+              clampInt(process.env.RSS_BRIEF_DEADLINE_MS, 150_000, 10_000, 600_000),
+            );
+          } catch (err: any) {
+            return errResult("calibrate", `❌ classifier error: ${err?.message ?? err}`);
+          }
           if (triage.mode === "heuristic") {
             return errResult(
               "calibrate",
@@ -1225,7 +1264,10 @@ const rssTool = defineTool({
         const res = await runPyJson([...args, "--json"]);
         if (!res.ok) return errResult("markread", `❌ markread failed: ${res.error ?? "unknown"}`);
         const data = res.data as any;
-        return okResult("markread", `✅ Marked ${data?.marked ?? 0} item(s) as read`, data);
+        const text = typeof res.text === "string" && res.text.trim()
+          ? res.text.trim()
+          : `✅ Marked ${data?.marked ?? 0} item(s) as read`;
+        return okResult("markread", text, data);
       }
 
       // ---------------------------------------------------------------- Admin

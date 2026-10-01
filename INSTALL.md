@@ -131,13 +131,13 @@ rss {action:"calibrate", op:"score"}            # accuracy + confidence calibrat
 | `RSS_JE_V_SKIP_CONF` | Min confidence to drop a `skip` item | `0.7` |
 | `RSS_JE_V_NONE_CONF` | Min confidence to drop a `no-change` opinion | `0.7` |
 | `RSS_VERIFY_BUDGET` | Hard web-verification cap per run | `4` |
-| `RSS_OPINION_RETIRE_RUNS` | Retire opinions not seen for N runs | `8` |
+| `RSS_OPINION_RETIRE_RUNS` | Retire opinions not seen for N periods | `8` |
 | `RSS_CALIBRATION_FILE` | Calibration file path | `<agent-dir>/rss-plugin/calibration.json` |
 
 ## Data notes
 
 - The database is SQLite. Tables: `rss_feeds` / `rss_items` / `rss_items_fts` plus the
-  report pipeline tables `rss_ledger_facts` / `rss_ledger_opinions` / `rss_runs` / `rss_state`
+  report pipeline tables `rss_ledger_facts` / `rss_ledger_opinions` / `rss_runs`
   (existing databases migrate automatically on first run).
 - `rss_feeds.tags` (comma-separated) enables category filtering via `rss unread -t <tag>`,
   `rss search -t <tag>`, and `rss list -t <tag>`; existing databases are migrated automatically.

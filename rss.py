@@ -219,13 +219,6 @@ SCHEMAS = [
         finished_at INTEGER
     );
     """,
-    """
-    CREATE TABLE IF NOT EXISTS rss_state (
-        key TEXT PRIMARY KEY,
-        value TEXT,
-        updated_at INTEGER
-    );
-    """,
 ]
 
 
@@ -272,10 +265,8 @@ def migrate_schema(conn: sqlite3.Connection):
         ("kind", "TEXT"),
         ("topic", "TEXT"),
         ("has_number", "INTEGER"),
-        ("novel", "INTEGER"),
         ("change", "TEXT"),
         ("verify_needed", "INTEGER"),
-        ("conf_json", "TEXT"),
         ("triage_json", "TEXT"),
         ("triaged_at", "INTEGER"),
         ("is_skipped", "INTEGER NOT NULL DEFAULT 0"),
@@ -963,7 +954,8 @@ def cmd_recent(feed_id: Optional[int], limit: int) -> str:
 
 
 def cmd_markread(item_id: Optional[int], tag: Optional[str] = None,
-                 older_than: Optional[int] = None, before: Optional[str] = None) -> str:
+                 older_than: Optional[int] = None,
+                 before: Optional[str] = None) -> tuple[str, dict]:
     if item_id is not None:
         conn = get_conn()
         try:
@@ -971,9 +963,9 @@ def cmd_markread(item_id: Optional[int], tag: Optional[str] = None,
         finally:
             conn.close()
         if not row:
-            return f"❌ No item with ID {item_id}"
+            return f"❌ No item with ID {item_id}", {"marked": 0}
         mark_as_read(item_id)
-        return f"✅ Marked item {item_id} as read"
+        return f"✅ Marked item {item_id} as read", {"marked": 1}
 
     filters: list[str] = []
     before_ts: Optional[int] = None
@@ -985,15 +977,16 @@ def cmd_markread(item_id: Optional[int], tag: Optional[str] = None,
         before_ts = _parse_ts(before)
         if before_ts is None:
             return (f"❌ Cannot parse time: '{before}'. Use a unix timestamp or ISO date, "
-                    f"e.g. 1757700000 or 2026-09-10 or 2026-09-10T12:00")
+                    f"e.g. 1757700000 or 2026-09-10 or 2026-09-10T12:00"), {"marked": 0}
         filters.append(f"before {_fmt_ts(before_ts)}")
 
     if not filters:
         count = mark_all_read()
-        return f"✅ Marked {count} item(s) as read" if count else "No unread items to mark"
+        text = f"✅ Marked {count} item(s) as read" if count else "No unread items to mark"
+        return text, {"marked": count}
 
     count = mark_read_filtered(tag=tag, older_than_hours=older_than, before_ts=before_ts)
-    return f"✅ Marked {count} unread item(s) as read ({', '.join(filters)})"
+    return f"✅ Marked {count} unread item(s) as read ({', '.join(filters)})", {"marked": count}
 
 
 def cmd_stats() -> str:
@@ -1109,6 +1102,7 @@ FORBIDDEN_PHRASES = ["惨烈", "崩了", "利好", "值得警惕", "大概率", 
 _SECTION_FACTS_RE = re.compile(r"^#{1,6}\s*一、\s*资讯速览", re.M)
 _SECTION_OPINIONS_RE = re.compile(r"^#{1,6}\s*二、\s*观点与趋势", re.M)
 _FACT_LINE_RE = re.compile(r"^\s*(?:[-*·]|\d+[.、])\s+(.*)$")
+_HEADING_LINE_RE = re.compile(r"^(?:#{1,6}\s+\S|\*{1,2}[^*\n]{1,60}\*{1,2}\s*[:：]?$)")
 _OPINION_FIELDS = ["观点：", "依据：", "检验：", "结论：", "趋势：", "与上期相比："]
 _NUM_UNIT_RE = re.compile(
     r"[+\-]?\d[\d,]*(?:\.\d+)?\s*(?:万亿|亿|万|%|％|美元|元|点|bp|个基点|倍)")
@@ -1117,6 +1111,35 @@ _NUM_BARE_RE = re.compile(r"[+\-]?\d[\d,]{1,}(?:\.\d+)?")
 
 def _count_hanzi(text: str) -> int:
     return sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+
+
+def _env_int(name: str, default: int, minimum: int = 0,
+             maximum: Optional[int] = None) -> int:
+    """Read an integer env var; empty/invalid values fall back to the default."""
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(float(raw))
+    except ValueError:
+        return default
+    value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def _env_float(name: str, default: float, minimum: float = 0.0,
+               maximum: float = 1.0) -> float:
+    """Read a float env var; empty/invalid values fall back to the default."""
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return min(maximum, max(minimum, value))
 
 
 def _bj_now() -> datetime:
@@ -1363,6 +1386,25 @@ def _extract_source(claim: str) -> str:
     return "(未署名)"
 
 
+def _split_trend(trend: str) -> tuple[str, str]:
+    """Best-effort split of the「趋势」field into (verification signal, time window).
+    Anything that cannot be parsed stays empty rather than duplicating the whole trend."""
+    text = (trend or "").strip()
+    if not text:
+        return "", ""
+    window = ""
+    match = re.search(
+        r"(?:未来|若|在)?\s*(?:\d+|一|两|三|四|五|六|七|八|九|十)\s*(?:周|天|日|个月|月|小时|年)(?:内|之内|以内)?",
+        text)
+    if match:
+        window = re.sub(r"^(?:未来|若|在)\s*", "", match.group(0)).strip()
+    signal = ""
+    match = re.search(r"(?:验证信号|信号|观察|关注|指标)[为是：:]\s*([^，。；;]+)", text)
+    if match:
+        signal = match.group(1).strip()[:120]
+    return signal, window
+
+
 def _ledger_upsert_opinions(parsed: dict, run_id: int) -> dict:
     added = updated = 0
     conn = get_conn()
@@ -1375,6 +1417,7 @@ def _ledger_upsert_opinions(parsed: dict, run_id: int) -> dict:
             source = _extract_source(claim)
             change = _map_change(fields.get("与上期相比：", ""))
             trend = (fields.get("趋势：") or "")[:300]
+            signal, time_window = _split_trend(trend)
             rows = conn.execute(
                 """SELECT id, claim FROM rss_ledger_opinions
                    WHERE source = ? AND status = 'active'""", (source,)).fetchall()
@@ -1387,7 +1430,7 @@ def _ledger_upsert_opinions(parsed: dict, run_id: int) -> dict:
                     best, match_id = ratio, row["id"]
             values = (claim[:240], (fields.get("依据：") or "")[:240],
                       (fields.get("检验：") or "")[:600], (fields.get("结论：") or "")[:240],
-                      trend, trend, trend, change)
+                      trend, signal, time_window, change)
             if match_id:
                 conn.execute(
                     """UPDATE rss_ledger_opinions SET claim = ?, evidence = ?, checks = ?,
@@ -1409,16 +1452,38 @@ def _ledger_upsert_opinions(parsed: dict, run_id: int) -> dict:
     return {"opinions_added": added, "opinions_updated": updated}
 
 
-def _retire_stale_opinions(run_id: int, after_runs: Optional[int] = None) -> int:
-    """Mark active opinions retired when they were not touched for N runs."""
-    threshold = int(after_runs if after_runs is not None
-                    else (os.getenv("RSS_OPINION_RETIRE_RUNS", "8") or 8))
+def _retire_stale_opinions(run_id: int, after_periods: Optional[int] = None) -> int:
+    """Retire active opinions not seen in the last N periods.
+
+    A period is one distinct (slot_date, slot) pair, so brief retries inside the
+    same period never accelerate retirement.
+    """
+    threshold = after_periods if after_periods is not None else _env_int(
+        "RSS_OPINION_RETIRE_RUNS", 8, 1, 1000)
     conn = get_conn()
     try:
+        periods = conn.execute(
+            """SELECT slot_date, slot, MAX(id) AS max_id FROM rss_runs
+               WHERE id <= ? AND slot_date IS NOT NULL
+               GROUP BY slot_date, slot ORDER BY max_id DESC LIMIT ?""",
+            (run_id, threshold)).fetchall()
+        if not periods:
+            return 0
+        conds: list[str] = []
+        params: list = []
+        for period in periods:
+            conds.append("(slot_date = ? AND slot = ?)")
+            params.extend([period["slot_date"], period["slot"]])
+        window_ids = [row["id"] for row in conn.execute(
+            f"SELECT id FROM rss_runs WHERE {' OR '.join(conds)}", params).fetchall()]
+        if not window_ids:
+            return 0
+        placeholders = ",".join("?" for _ in window_ids)
         cur = conn.execute(
-            """UPDATE rss_ledger_opinions SET status = 'retired', updated_at = ?
-               WHERE status = 'active' AND last_seen_run IS NOT NULL AND last_seen_run < ?""",
-            (int(time.time()), run_id - threshold))
+            f"""UPDATE rss_ledger_opinions SET status = 'retired', updated_at = ?
+                WHERE status = 'active' AND last_seen_run IS NOT NULL
+                  AND last_seen_run NOT IN ({placeholders})""",
+            (int(time.time()), *window_ids))
         conn.commit()
         return cur.rowcount
     finally:
@@ -1464,7 +1529,7 @@ def _group_facts(facts: list[dict], threshold: float = 0.62) -> list[dict]:
 # ---- report parsing / validation ----
 
 def _parse_report(body: str) -> dict:
-    out: dict = {"facts": [], "opinions": [], "section": None}
+    out: dict = {"facts": [], "opinions": [], "prose": [], "section": None}
     current: Optional[dict] = None
     for idx, raw in enumerate(body.splitlines(), 1):
         line = raw.rstrip()
@@ -1476,13 +1541,22 @@ def _parse_report(body: str) -> dict:
             out["section"], current = "opinions", None
             continue
         if out["section"] == "facts":
+            if not stripped:
+                continue
             match = _FACT_LINE_RE.match(line)
-            text = (match.group(1) if match else line).strip()
+            if not match:
+                # 标题只做分组，不计入事实；其余散文行交给校验报错。
+                if not _HEADING_LINE_RE.match(stripped):
+                    out["prose"].append({"line": idx, "text": stripped})
+                continue
+            text = match.group(1).strip()
             if not text:
                 continue
             out["facts"].append({"line": idx, "text": text,
                                  "continuation": text.startswith("延续")})
         elif out["section"] == "opinions":
+            if _HEADING_LINE_RE.match(stripped):
+                continue
             if stripped.startswith("观点：") or stripped.startswith("- 观点：") \
                     or stripped.startswith("* 观点："):
                 current = {"line": idx, "blocks": [stripped], "fields": {}}
@@ -1508,6 +1582,9 @@ def _validate_report(body: str) -> tuple[dict, list[dict]]:
         violations.append({"line": 0, "kind": "structure", "why": "缺少「一、资讯速览」标题"})
     if not _SECTION_OPINIONS_RE.search(body):
         violations.append({"line": 0, "kind": "structure", "why": "缺少「二、观点与趋势」标题"})
+    for prose in parsed.get("prose", []):
+        violations.append({"line": prose["line"], "kind": "structure",
+                           "why": "速览区只能使用「- 」列表行（标题除外）"})
     skip_kw = _skip_keywords()
     for fact in parsed["facts"]:
         count = _count_hanzi(fact["text"])
@@ -1563,8 +1640,8 @@ def _read_stdin_json(default: Any = None) -> Any:
 # ---- commands ----
 
 def cmd_brief(max_items: Optional[int] = None, do_fetch: bool = True) -> tuple[str, dict]:
-    max_items = max(1, min(int(max_items or os.getenv("RSS_BRIEF_MAX", "250") or 250),
-                           MAX_ITEM_LIMIT))
+    limit = int(max_items) if max_items else _env_int("RSS_BRIEF_MAX", 250, 1, MAX_ITEM_LIMIT)
+    max_items = max(1, min(limit, MAX_ITEM_LIMIT))
     now = _bj_now()
     slot = "morning" if now.hour < 12 else "evening"
     report_name = now.strftime("%m-%d_%H") + ".md"
@@ -1680,9 +1757,10 @@ def cmd_payload(run_id: Optional[int] = None) -> tuple[str, dict]:
     finally:
         conn.close()
 
-    facts_max = int(os.getenv("RSS_BRIEF_FACTS_MAX", "60") or 60)
-    op_top = int(os.getenv("RSS_BRIEF_OPINION_TOP", "10") or 10)
-    op_chars = int(os.getenv("RSS_BRIEF_OPINION_CHARS", "1200") or 1200)
+    facts_max = _env_int("RSS_BRIEF_FACTS_MAX", 60, 1, 500)
+    op_top = _env_int("RSS_BRIEF_OPINION_TOP", 10, 1, 100)
+    op_chars = _env_int("RSS_BRIEF_OPINION_CHARS", 1200, 100, 10000)
+    none_conf = _env_float("RSS_JE_V_NONE_CONF", 0.7)
     facts: list[dict] = []
     opinions: list[dict] = []
     dropped_none = 0
@@ -1714,7 +1792,7 @@ def cmd_payload(run_id: Optional[int] = None) -> tuple[str, dict]:
             # “没变化就不重复”：高置信的 none 直接不进观点池；
             # 低置信的 none 不采信，改为 new + 标记，交给主模型判断。
             if relation == "none":
-                if relation_conf >= 0.7:
+                if relation_conf >= none_conf:
                     dropped_none += 1
                     continue
                 relation = "new"
@@ -1834,12 +1912,19 @@ def cmd_check(body: str) -> tuple[str, dict]:
     return text, data
 
 
-def _commit_kwargs() -> dict:
+def _commit_kwargs(args: Any = None) -> dict:
     payload = _read_stdin_json(default={}) or {}
+    run_id = payload.get("run_id")
+    strict = bool(payload.get("strict", True))
+    if args is not None:
+        if getattr(args, "run", None) is not None:
+            run_id = args.run
+        if getattr(args, "no_strict", False):
+            strict = False
     return {
         "body": payload.get("body", ""),
-        "run_id": payload.get("run_id"),
-        "strict": bool(payload.get("strict", True)),
+        "run_id": run_id,
+        "strict": strict,
         "websearch_used": int(payload.get("websearch_used", 0) or 0),
     }
 
@@ -1860,6 +1945,16 @@ def cmd_commit(body: str, run_id: Optional[int] = None, strict: bool = True,
         return "❌ No brief run found", {"ok": False,
                                          "violations": [{"line": 0, "kind": "state",
                                                          "why": "没有可提交的 brief run"}]}
+    if run_id is None:
+        if run["status"] == "committed":
+            return "❌ Latest run already committed", {"ok": False, "violations": [
+                {"line": 0, "kind": "state",
+                 "why": "最近一次 run 已提交；请先执行 brief 开始新一期（或显式传 run_id 补提）"}]}
+        yesterday = (_bj_now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        if (run["slot_date"] or "") < yesterday:
+            return "❌ Latest run is stale", {"ok": False, "violations": [
+                {"line": 0, "kind": "state",
+                 "why": f"最近一次 run 属于 {run['slot_date'] or '未知日期'}，早于昨天；请先执行 brief"}]}
     rid = int(run["id"])
     body_clean = re.sub(r"^\s*#\s*\d{2}-\d{2}[ _]\d{2}\s*[｜|][^\n]*\n+", "", body, count=1)
     facts_used = len([f for f in parsed["facts"] if not f["continuation"]])
@@ -2055,7 +2150,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("commit", parents=[common],
                        help="Finalize the report: validate, write, ledger, mark read")
-    p.set_defaults(func=lambda a: cmd_commit(**_commit_kwargs()))
+    p.add_argument("--run", type=int, default=None,
+                   help="Explicit run id (default: latest; must be a fresh brief)")
+    p.add_argument("--no-strict", action="store_true",
+                   help="Write even when validation fails (violations are recorded)")
+    p.set_defaults(func=lambda a: cmd_commit(**_commit_kwargs(a)))
 
     p = sub.add_parser("ledger", parents=[common], help="Show the fact/opinion ledger")
     p.set_defaults(func=lambda a: cmd_ledger())
@@ -2087,8 +2186,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         text, data = result, None
     if json_mode:
-        print(json.dumps({"ok": True, "action": args.action, "data": data, "error": None},
-                         ensure_ascii=False))
+        print(json.dumps({"ok": True, "action": args.action, "data": data, "error": None,
+                          "text": text}, ensure_ascii=False))
     else:
         print(text)
     return 0

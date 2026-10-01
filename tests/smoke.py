@@ -132,7 +132,9 @@ def main() -> int:
         print("check / commit:")
         body = (
             "## 一、资讯速览\n"
+            "**国际经济与市场**\n"
             "- 中国1-8月规上工业利润同比+15.7%\n"
+            "### 科技\n"
             "- 英伟达发布新一代AI芯片，算力提升2倍\n"
             "- 延续：霍尔木兹封锁未解\n\n"
             "## 二、观点与趋势\n"
@@ -145,6 +147,8 @@ def main() -> int:
         )
         chk = run_json(["check"], stdin=json.dumps({"body": body}), env=env)["data"]
         check("valid draft has no violations", chk["violations"] == [], str(chk["violations"]))
+        check("headings are not facts", chk["stats"]["facts"] == 2 and chk["stats"]["continuations"] == 1,
+              str(chk["stats"]))
         bad = run_json(["check"], stdin=json.dumps(
             {"body": "## 一、资讯速览\n- 市场认为黄金会涨\n- 参见 https://x.com/a\n\n## 二、观点与趋势\n- 观点：某人认为崩了\n  依据：无"}),
             env=env)["data"]
@@ -170,6 +174,8 @@ def main() -> int:
             "SELECT COUNT(*) c FROM rss_ledger_facts WHERE status = 'confirmed'").fetchone()["c"] == 2)
         check("opinion ledger written", conn.execute(
             "SELECT COUNT(*) c FROM rss_ledger_opinions").fetchone()["c"] == 1)
+        check("no heading rows in ledger", conn.execute(
+            "SELECT COUNT(*) c FROM rss_ledger_facts WHERE text LIKE '**%' OR text LIKE '#%'").fetchone()["c"] == 0)
 
         print("second run (ledger reuse):")
         # simulate the next slot (same-hour runs would reuse the filename)
@@ -223,6 +229,20 @@ def main() -> int:
             "SELECT status FROM rss_ledger_facts WHERE text LIKE '%传闻%'").fetchone()["status"] == "unconfirmed")
         check("single opinion row", conn.execute(
             "SELECT COUNT(*) c FROM rss_ledger_opinions").fetchone()["c"] == 1)
+        conn.execute(
+            "INSERT INTO rss_items (guid,feed_id,title,link,published,content,summary,categories,"
+            "is_read,is_starred,created_at) VALUES ('g9',1,'待标已读条目','https://ex.com/z1',?,?,?,'[]',0,0,?)",
+            (now, "待标已读条目", "待标已读条目", now),
+        )
+        conn.commit()
+        mr = run_json(["markread"], env=env)
+        check("markread json reports count", mr["data"]["marked"] == 1, str(mr.get("data")))
+        stats_env = run_json(["stats"], env=env)
+        check("json envelope carries text",
+              isinstance(stats_env.get("text"), str) and bool(stats_env["text"]), str(stats_env)[:120])
+        stale = run_json(["commit"], stdin=json.dumps({"body": body}), env=env)
+        check("commit without fresh brief rejected", stale["data"]["ok"] is False,
+              str(stale.get("data"))[:200])
         conn.close()
 
         print("sample:")
