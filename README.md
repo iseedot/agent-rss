@@ -1,92 +1,119 @@
 # pi-agent-rss
 
-An RSS aggregation plugin for pi agent: manage RSS subscriptions through conversation —
-add feeds, tag them by category, fetch updates, read unread items, full-text search,
-and mark items as read.
+An RSS **report engine** for pi, built for the scheduled short-report task:
+every run turns all unread items into a facts + opinions digest with a persistent
+cross-period ledger, without flooding the model with raw feed text.
 
 ```
-rss/                (repository root = pi package root)
-├── index.ts        Extension entry: tools, environment gate, optional scheduled fetch
-├── rss.py          Single-file Python backend (stdlib + feedparser only)
-├── INSTALL.md      AI-readable setup guide
-└── data/           Legacy data location (auto-migrated on first run)
+pi-agent-rss/            (repository root = pi package root)
+├── index.ts             Extension: rss tool (brief/qa/commit pipeline, credentials)
+├── rss.py               Single-file Python backend (stdlib + feedparser only)
+├── INSTALL.md           AI-readable setup guide
+└── docs/                Design plan (PLAN-rss-report.md)
 ```
 
 ## Install
 
 ```bash
-# from a local directory
 pi install ./pi-agent-rss
-
-# from git after pushing
-pi install git:github.com/iseedot/agent-rss
+# or from git: pi install git:github.com/iseedot/agent-rss
 ```
 
-On first use, have the AI read `INSTALL.md` to prepare the environment
-(python3 + feedparser, one command each).
+On first use have the AI read `INSTALL.md` (python3 + feedparser).
 
-## Tools
+## The report pipeline (3 calls per run)
 
-| action | description | parameters |
+| stage | call | what it does |
 |---|---|---|
-| `rss add` | Add a subscription | feed_url, tags (optional) |
-| `rss fetch` | Fetch all enabled feeds | — |
-| `rss unread` | List unread items (shows total) | limit, tag, feed_id (optional filters) |
-| `rss recent` | Recent items from a feed (any read state) | feed_id, limit |
-| `rss search` | Full-text search (FTS5) | query, limit, tag, feed_id (optional filters) |
-| `rss markread` | Mark as read: all, one item, or batch by tag/time | item_id, tag, older_than, before |
-| `rss list` | List subscriptions | tag (optional filter) |
-| `rss stats` | Per-feed & per-tag stats: counts, last item/fetch, errors | — |
-| `rss remove` | Remove a subscription | feed_id |
-| `rss tag` | Set/replace tags on a feed | feed_id, tags |
-| `rss tags` | List all tags with feed counts | — |
+| 1 | `rss {action:"brief"}` | fetch all feeds → all unread → drop sports/entertainment → dedupe → triage (heuristic now, jev next) → previous-period ledger diff → last report. Returns the structured payload: `facts`, `opinions`, `ledger`, `last_report`, `session`. |
+| 2 | `rss {action:"qa", draft:"…"}` | validates the draft: ≤2500 hanzi, per-line limits, ≤3 opinions, six opinion fields, tone words, links; (P2) jev line lint + web verification under a hard ≤4 budget. |
+| 3 | `rss {action:"commit", body:"…"}` | final gate: validates, builds the first-line header, saves `MM-DD_hh.md` (Beijing time), updates the fact/opinion ledger, marks this batch read, returns the final text. Reply with that text verbatim. |
 
-Optional scheduling: set `RSS_AUTO_FETCH_MINUTES=60` to fetch hourly and push
-new items to the agent automatically.
+`brief` returns `next_steps`; the scheduled prompt should tell the model to use only
+these three calls (see `prompts/rss-report.md`).
 
-## Tagging feeds by category
+### Why the pipeline exists
 
-Feeds carry comma-separated tags (`rss_feeds.tags`) so you can group
-subscriptions and query one category at a time:
+- The model never reads raw feed dumps: only the curated payload enters context.
+- Mechanical work (fetch window, dedupe, ledger, counters, filename, header, mark-read)
+  is deterministic and lives in the plugin.
+- "No change, no repeat" and "待确认 stays unconfirmed" are enforced by a SQLite ledger,
+  not by re-reading the last Markdown reports.
+
+## Basic / admin actions
+
+| action | description |
+|---|---|
+| `fetch` | fetch all subscriptions now |
+| `unread` | list unread items (tag/feed/limit filters) |
+| `markread` | mark read: `ids`, `item_id`, `tag`, `older_than`, `before` |
+| `manage` | `op` = add / remove / list / tag / tags / stats |
+| `calibrate` | jev Chinese quality gate: `op:"sample"` writes labeled-sample file, edit labels, `op:"score"` computes accuracy + confidence calibration |
+
+## jev triage & calibration
+
+With `TYPESAFE_API_KEY` configured, `brief` runs batch classifier passes:
+kind/topic/value (all items), opinion change vs the active ledger, and fact repeats vs
+previous facts. Discard decisions (`skip`, `change=none`) only apply at high confidence;
+anything uncertain passes through to the model. `qa` additionally runs per-line semantic
+lint and web verification via `source_check` under a hard budget (`RSS_VERIFY_BUDGET`, default 4).
+
+Because Jev's CJK accuracy is weaker than English, calibrate before trusting discard
+decisions:
 
 ```
-Add with tags:   rss add https://hnrss.org/frontpage -t tech,news
-Set tags later:  rss tag 1 -t tech
-Show all tags:   rss tags
-List by tag:     rss list -t tech
-Unread by tag:   rss unread -t tech
-Search by tag:   rss search "LLM" -t tech
-By single feed:  rss unread -f 1 / rss recent -f 1 / rss search kw -f 1
+rss {action:"calibrate", op:"sample", max:50}   # triage 50 random items -> calibration.json
+# edit each row: label = fact | opinion | mixed | skip
+rss {action:"calibrate", op:"score"}            # accuracy, per-class, confidence buckets
 ```
 
-Tag matching is exact and case-insensitive; a feed may carry multiple tags.
-Existing databases are migrated automatically on first run.
+If the score reports `NOT trustworthy`, raise `RSS_JE_V_SKIP_CONF` / `RSS_JE_V_NONE_CONF`
+(e.g. 0.85) or keep triage advisory-only.
 
-## Batch marking & health stats
+## Data & state
 
-Everything that used to require direct SQLite access is now a tool call:
+- DB: `<pi config dir>/rss-data/rss.db` (override `RSS_DB_PATH`).
+- Tables: `rss_feeds` / `rss_items` / `rss_items_fts` plus `rss_ledger_facts`,
+  `rss_ledger_opinions`, `rss_runs`, `rss_state` (auto-migrated on first run).
+- Reports: `RSS_REPORT_DIR` (default `~/Chat/rss/`), filenames `MM-DD_hh.md` in Beijing time.
+- Tags live in `rss_feeds.tags` and are used as topical hints (真机: 技术/财经/资讯/AI科技).
 
-```
-Mark by tag:          rss markread -t tech
-Mark older than 48h:  rss markread --older-than 48
-Mark before a date:   rss markread --before 2026-09-10  (unix ts or ISO date)
-Combined:             rss markread -t tech --older-than 48
-Feed health & counts: rss stats   (items/unread per feed and per tag,
-                                   last item/fetch time, fetch errors)
-Unread shows totals:  rss unread  → "(5 shown / 12 total)"
-```
+## Credentials (jev / typesafe, P2)
 
-`rss stats` also flags failing subscriptions (`fetch_error`) so dead feeds can
-be identified without touching the database.
+Resolution order — first hit wins:
 
-## Design
+1. `TYPESAFE_API_KEY` environment variable
+2. `<agent-dir>/rss-plugin/auth.json` (mode 0600; group/other-readable files are refused)
+3. `TYPESAFE_KEY_FILE` or `~/.config/typesafe/key`
 
-- **Minimal dependencies**: Python side uses only `feedparser` (pure Python), everything else is stdlib; pi side has no npm dependencies.
-- **Fixed schema**: `rss_feeds` / `rss_items` / `rss_items_fts` (FTS5 full-text search), stable and documented.
-- **Portable data**: the database defaults to `<pi config dir>/rss-data/rss.db`
-  (outside the plugin directory, so package updates never wipe it); set `RSS_DB_PATH`
-  to point at any SQLite file to reuse an existing database.
+The resolved key is injected into `process.env.TYPESAFE_API_KEY` so pi's typesafe
+provider uses it for `modelRegistry.classify()`. Keys never go into argv, URLs, or logs.
+
+## Environment variables
+
+| variable | default | purpose |
+|---|---|---|
+| `RSS_DB_PATH` | `<pi config>/rss-data/rss.db` | database location |
+| `RSS_REPORT_DIR` | `~/Chat/rss` | where reports are written |
+| `RSS_TZ` | `Asia/Shanghai` | timezone for filenames/headers only |
+| `RSS_BRIEF_MAX` | 250 | max items selected per brief |
+| `RSS_BRIEF_FACTS_MAX` | 60 | facts included in the payload |
+| `RSS_BRIEF_OPINION_TOP` | 10 | opinion candidates with full text |
+| `RSS_BRIEF_OPINION_CHARS` | 1200 | per-opinion text truncation |
+| `RSS_FETCH_WORKERS` | 6 | concurrent feed fetches |
+| `RSS_SKIP_KEYWORDS` | built-in sports/entertainment list | skip filter |
+| `RSS_PY_PYTHON` | `python3` | interpreter path (venv) |
+| `RSS_JE_V_MODEL` | `typesafe/jev-latest` | classifier model |
+| `RSS_JE_V_CONCURRENCY` | 4 | classifier concurrency |
+| `RSS_JE_V_BATCH` | 10 | items per classifier batch |
+| `RSS_JE_V_SKIP_CONF` | 0.7 | min confidence to drop a `skip` item |
+| `RSS_JE_V_NONE_CONF` | 0.7 | min confidence to drop a `no-change` opinion |
+| `RSS_BRIEF_DEADLINE_MS` | 150000 | triage time budget per brief |
+| `RSS_QA_DEADLINE_MS` | 120000 | lint/verification time budget per qa |
+| `RSS_VERIFY_BUDGET` | 4 | hard web-verification cap per run |
+| `RSS_OPINION_RETIRE_RUNS` | 8 | retire opinions not seen for N runs |
+| `RSS_CALIBRATION_FILE` | `<agent-dir>/rss-plugin/calibration.json` | calibrate file
 
 ## License
 
-[MIT](LICENSE) — use, modify, and redistribute freely with attribution.
+[MIT](LICENSE)

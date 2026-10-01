@@ -1,15 +1,16 @@
 {
   "name": "pi-agent-rss",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "license": "MIT",
   "type": "module",
-  "description": "RSS aggregation plugin: add/fetch/unread/search/markread/list/remove, feed tags for category filtering, optional scheduled fetch",
+  "description": "RSS report engine for pi: brief/qa/commit pipeline for scheduled facts+opinions digests, jev triage ready, plus basic fetch/unread/markread and feed management",
   "keywords": ["pi-package"],
   "scripts": {
-    "check": "echo 'nothing to check'"
+    "check": "python3 tests/smoke.py"
   },
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": ["./index.ts"],
+    "prompts": ["./prompts"]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

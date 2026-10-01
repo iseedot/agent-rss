@@ -74,18 +74,41 @@ Once installed, just tell pi: "add subscription <feed URL>" and the plugin will 
 
 ## Usage examples
 
+Report pipeline (the scheduled task; use these three calls, nothing else):
+
 ```
-Add a feed:       rss add https://example.com/feed.xml
-Fetch updates:    rss fetch
-Read unread:      rss unread (default 20 items, adjust with limit)
-By category:      rss unread -t tech   (also works for search and list)
-By single feed:   rss recent -f 1  /  rss unread -f 1  /  rss search kw -f 1
-Search history:   rss search <keyword> (FTS5 full-text search)
-Tag a feed:       rss tag <feed_id> -t tech,news
-Mark as read:     rss markread (all unread); rss markread <item_id> (single item)
-Batch mark read:  rss markread -t tech --older-than 48  (tag + time filters)
-Feed stats:       rss stats  (counts, last item/fetch, fetch errors, by tag)
-Manage feeds:     rss list / rss remove <feed_id>
+1) Prepare:  rss {action:"brief"}                 # fetch + payload in one call
+2) Validate: rss {action:"qa", draft:"..."}      # violations + verification
+3) Finalize: rss {action:"commit", body:"..."}   # save + ledger + mark read
+```
+
+Basic and admin:
+
+```
+Fetch now:        rss {action:"fetch"}
+List unread:      rss {action:"unread", limit:20, tag?}
+Mark read:        rss {action:"markread", ids:"1,2,3"}
+                  rss {action:"markread", tag:"技术", older_than:48}
+Manage feeds:     rss {action:"manage", op:"add", feed_url:"...", tags:"技术"}
+                  rss {action:"manage", op:"list"} / op:"remove" / op:"tag" / op:"tags" / op:"stats"
+```
+
+On the command line the same backend works directly: `python3 rss.py brief --json`,
+`payload --json`, `check --json` (JSON `{"body":...}` on stdin), `commit --json`,
+`annotate --json`, `ledger --json`, `sample --json`.
+
+### jev triage and Chinese calibration
+
+With a jev key configured, `brief` classifies items in batches (kind/topic/value, opinion
+change vs the ledger, fact repeats), and `qa` runs semantic line lint plus web verification
+(hard cap `RSS_VERIFY_BUDGET`, default 4). Discard decisions only fire at high confidence.
+
+Jev's Chinese accuracy is weaker than English, so calibrate once before trusting it:
+
+```
+rss {action:"calibrate", op:"sample", max:50}   # writes calibration.json (labels empty)
+# fill label = fact | opinion | mixed | skip for every row
+rss {action:"calibrate", op:"score"}            # accuracy + confidence calibration
 ```
 
 ## Optional configuration (environment variables)
@@ -93,12 +116,29 @@ Manage feeds:     rss list / rss remove <feed_id>
 | Variable | Purpose | Default |
 |---|---|---|
 | `RSS_DB_PATH` | Database file path (explicit override) | `<pi config dir>/rss-data/rss.db` — e.g. `~/.pi/agent/rss-data/rss.db` |
-| `RSS_AUTO_FETCH_MINUTES` | Scheduled fetch interval in minutes; new items are pushed to the agent | empty (disabled) |
-| `RSS_PY_PYTHON` | Python interpreter path (only needed when using a venv or a non-default python3) | `python3` |
+| `RSS_REPORT_DIR` | Where `MM-DD_hh.md` reports are written | `~/Chat/rss` |
+| `RSS_TZ` | Timezone for report filenames/headers (not for filtering) | `Asia/Shanghai` |
+| `RSS_BRIEF_MAX` | Max unread items selected per brief | `250` |
+| `RSS_BRIEF_FACTS_MAX` | Facts included in the brief payload | `60` |
+| `RSS_BRIEF_OPINION_TOP` | Opinion candidates with full text | `10` |
+| `RSS_BRIEF_OPINION_CHARS` | Per-opinion text truncation | `1200` |
+| `RSS_FETCH_WORKERS` | Concurrent feed fetches | `6` |
+| `RSS_SKIP_KEYWORDS` | Comma-separated sports/entertainment skip list | built-in list |
+| `RSS_PY_PYTHON` | Python interpreter path (venv or non-default python3) | `python3` |
+| `TYPESAFE_API_KEY` | jev classifier key (or plugin store / shared file, see README) | empty |
+| `RSS_JE_V_MODEL` | Classifier model | `typesafe/jev-latest` |
+| `RSS_JE_V_CONCURRENCY` | Classifier concurrency | `4` |
+| `RSS_JE_V_SKIP_CONF` | Min confidence to drop a `skip` item | `0.7` |
+| `RSS_JE_V_NONE_CONF` | Min confidence to drop a `no-change` opinion | `0.7` |
+| `RSS_VERIFY_BUDGET` | Hard web-verification cap per run | `4` |
+| `RSS_OPINION_RETIRE_RUNS` | Retire opinions not seen for N runs | `8` |
+| `RSS_CALIBRATION_FILE` | Calibration file path | `<agent-dir>/rss-plugin/calibration.json` |
 
 ## Data notes
 
-- The database is SQLite (tables: `rss_feeds` / `rss_items` / `rss_items_fts`).
+- The database is SQLite. Tables: `rss_feeds` / `rss_items` / `rss_items_fts` plus the
+  report pipeline tables `rss_ledger_facts` / `rss_ledger_opinions` / `rss_runs` / `rss_state`
+  (existing databases migrate automatically on first run).
 - `rss_feeds.tags` (comma-separated) enables category filtering via `rss unread -t <tag>`,
   `rss search -t <tag>`, and `rss list -t <tag>`; existing databases are migrated automatically.
 - The database lives **outside the plugin directory** (default: `<pi config dir>/rss-data/rss.db`),
