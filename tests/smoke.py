@@ -176,6 +176,21 @@ def main() -> int:
             "SELECT COUNT(*) c FROM rss_ledger_opinions").fetchone()["c"] == 1)
         check("no heading rows in ledger", conn.execute(
             "SELECT COUNT(*) c FROM rss_ledger_facts WHERE text LIKE '**%' OR text LIKE '#%'").fetchone()["c"] == 0)
+        baseline_fact_id = conn.execute(
+            "SELECT id FROM rss_ledger_facts WHERE text LIKE '%规上工业%'").fetchone()["id"]
+        check("baseline fact recorded", baseline_fact_id is not None)
+
+        run_json(["runstats"],
+                 stdin=json.dumps({"run_id": run_id, "jev_stats": {"triage": {"calls": 3}}}),
+                 env=env)
+        run_json(["runstats"],
+                 stdin=json.dumps({"run_id": run_id, "jev_stats": {"qa": {"verification": {"used": 2}}}}),
+                 env=env)
+        runs = run_json(["runs", "--limit", "1"], env=env)["data"]["runs"][0]
+        check("runstats merged into run",
+              runs["jev_stats"]["triage"]["calls"] == 3
+              and runs["jev_stats"]["qa"]["verification"]["used"] == 2,
+              str(runs.get("jev_stats")))
 
         print("second run (ledger reuse):")
         # simulate the next slot (same-hour runs would reuse the filename)
@@ -197,14 +212,29 @@ def main() -> int:
         conn.close()
 
         brief2 = run_json(["brief", "--no-fetch"], env=env)["data"]
-        run_json(["annotate"], stdin=json.dumps([
+        ann2 = [
             {"id": i["id"], "kind": "opinion", "value": 7, "relation": "reinforce",
              "relation_confidence": 0.81, "change_hint": "被强化", "verify_needed": True}
             for i in brief2["items"] if "美债" in i["title"]
-        ]), env=env)
+        ]
+        for i in brief2["items"]:
+            if "传闻" in i["title"]:
+                ann2.append({"id": i["id"], "kind": "fact", "value": 6,
+                             "repeat_of": baseline_fact_id, "flags": ["repeat_no_new_number"]})
+        run_json(["annotate"], stdin=json.dumps(ann2), env=env)
         payload2 = run_json(["payload", "--run", str(brief2["run_id"])], env=env)["data"]
         check("prev report linked", payload2["session"]["prev_report"] == "09-30_21.md")
         check("opinion carries change", any(o["relation"] == "reinforce" for o in payload2["opinions"]))
+        check("payload ledger trimmed to referenced",
+              [f["id"] for f in payload2["ledger"]["prev_facts"]] == [baseline_fact_id],
+              str(payload2["ledger"]["prev_facts"]))
+        check("last report omitted when ledger is warm",
+              payload2["counts"]["last_report_included"] is False
+              and payload2["last_report"]["text"] == "",
+              str(payload2["counts"]))
+        rumor = next((f for f in payload2["facts"] if "传闻" in f["title"]), None)
+        check("repeat fact keeps title only", rumor is not None and "summary" not in rumor,
+              str(rumor))
 
         body2 = (
             "## 一、资讯速览\n"
@@ -244,6 +274,32 @@ def main() -> int:
         check("commit without fresh brief rejected", stale["data"]["ok"] is False,
               str(stale.get("data"))[:200])
         conn.close()
+
+        print("backfill:")
+        legacy = tmp / "reports" / "08-30_21.md"
+        legacy.write_text(
+            "# 08-30 21｜本期使用 2 条（速览 1 条 + 观点 1 条）｜本次新抓取 0 条｜上期：无\n\n"
+            "## 一、资讯速览\n"
+            "- 回填测试事实一条\n\n"
+            "## 二、观点与趋势\n"
+            "- 观点：@回填 认为测试观点成立\n"
+            "  依据：回填依据\n"
+            "  检验：未证实\n"
+            "  结论：存疑\n"
+            "  趋势：若两周内指标变化则成立；验证信号为指标\n"
+            "  与上期相比：新出现",
+            encoding="utf-8",
+        )
+        dry = run_json(["backfill", "--file", str(legacy), "--dry-run"], env=env)["data"]
+        check("backfill dry-run counts",
+              dry["details"][0]["facts"] == 1 and dry["details"][0]["opinions"] == 1,
+              str(dry))
+        bf = run_json(["backfill", "--file", str(legacy)], env=env)["data"]
+        check("backfill added rows", bf["facts_added"] >= 1 and bf["opinions_added"] >= 1, str(bf))
+        conn2 = sqlite3.connect(tmp / "rss.db")
+        check("backfill run recorded", conn2.execute(
+            "SELECT COUNT(*) c FROM rss_runs WHERE status = 'backfilled'").fetchone()[0] == 1)
+        conn2.close()
 
         print("sample:")
         sample = run_json(["sample", "--n", "3"], env=env)["data"]

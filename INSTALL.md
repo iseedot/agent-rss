@@ -82,6 +82,14 @@ Report pipeline (the scheduled task; use these three calls, nothing else):
 3) Finalize: rss {action:"commit", body:"..."}   # save + ledger + mark read
 ```
 
+Ops helpers (run once / for monitoring):
+
+```
+rss {action:"manage", op:"runs", limit:10}    # durations, counts, jev calls/tokens/cost
+python3 rss.py backfill --dry-run --last 2    # preview ledger backfill from old reports
+python3 rss.py backfill --last 2              # seed the ledger so 延续/repeat work immediately
+```
+
 Basic and admin:
 
 ```
@@ -119,9 +127,12 @@ rss {action:"calibrate", op:"score"}            # accuracy + confidence calibrat
 | `RSS_REPORT_DIR` | Where `MM-DD_hh.md` reports are written | `~/Chat/rss` |
 | `RSS_TZ` | Timezone for report filenames/headers (not for filtering) | `Asia/Shanghai` |
 | `RSS_BRIEF_MAX` | Max unread items selected per brief | `250` |
-| `RSS_BRIEF_FACTS_MAX` | Facts included in the brief payload | `60` |
-| `RSS_BRIEF_OPINION_TOP` | Opinion candidates with full text | `10` |
-| `RSS_BRIEF_OPINION_CHARS` | Per-opinion text truncation | `1200` |
+| `RSS_BRIEF_FACTS_MAX` | Facts included in the brief payload | `40` |
+| `RSS_BRIEF_FACT_CHARS` | Per-fact summary truncation | `200` |
+| `RSS_BRIEF_OPINION_TOP` | Opinion candidates with full text | `8` |
+| `RSS_BRIEF_OPINION_CHARS` | Per-opinion text truncation | `800` |
+| `RSS_BRIEF_INCLUDE_LAST_REPORT` | Include previous report text (`auto` = only when ledger is empty) | auto |
+| `RSS_RUNS_LIMIT` | Default row count for `runs` | `10` |
 | `RSS_FETCH_WORKERS` | Concurrent feed fetches | `6` |
 | `RSS_SKIP_KEYWORDS` | Comma-separated sports/entertainment skip list | built-in list |
 | `RSS_PY_PYTHON` | Python interpreter path (venv or non-default python3) | `python3` |

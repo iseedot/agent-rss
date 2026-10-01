@@ -51,8 +51,21 @@ without a bullet are reported as structure violations by `qa`/`commit`.
 | `fetch` | fetch all subscriptions now |
 | `unread` | list unread items (tag/feed/limit filters) |
 | `markread` | mark read: `ids`, `item_id`, `tag`, `older_than`, `before` |
-| `manage` | `op` = add / remove / list / tag / tags / stats |
+| `manage` | `op` = add / remove / list / tag / tags / stats / runs / backfill |
 | `calibrate` | jev Chinese quality gate: `op:"sample"` writes labeled-sample file, edit labels, `op:"score"` computes accuracy + confidence calibration |
+
+## Cost visibility & cold-start backfill
+
+```
+rss {action:"manage", op:"runs", limit:10}    # per-run duration, counts, jev calls/tokens/cost
+python3 rss.py backfill --last 2              # seed the ledger from existing reports (run once)
+python3 rss.py backfill --dry-run --last 2    # preview without writing
+```
+
+`brief` writes triage usage (calls, per-pass batches, tokens, cost) and `qa` writes lint/
+verification usage into `rss_runs.jev_stats`; `commit` records the web-search count.
+Backfilling makes 「延续 / repeat / opinion change」 work immediately instead of waiting
+for the ledger to fill up naturally.
 
 ## jev triage & calibration
 
@@ -101,9 +114,12 @@ provider uses it for `modelRegistry.classify()`. Keys never go into argv, URLs, 
 | `RSS_REPORT_DIR` | `~/Chat/rss` | where reports are written |
 | `RSS_TZ` | `Asia/Shanghai` | timezone for filenames/headers only |
 | `RSS_BRIEF_MAX` | 250 | max items selected per brief |
-| `RSS_BRIEF_FACTS_MAX` | 60 | facts included in the payload |
-| `RSS_BRIEF_OPINION_TOP` | 10 | opinion candidates with full text |
-| `RSS_BRIEF_OPINION_CHARS` | 1200 | per-opinion text truncation |
+| `RSS_BRIEF_FACTS_MAX` | 40 | facts included in the payload |
+| `RSS_BRIEF_FACT_CHARS` | 200 | per-fact summary truncation |
+| `RSS_BRIEF_OPINION_TOP` | 8 | opinion candidates with full text |
+| `RSS_BRIEF_OPINION_CHARS` | 800 | per-opinion text truncation |
+| `RSS_BRIEF_INCLUDE_LAST_REPORT` | auto | include the previous report text (`auto` = only when the ledger is empty) |
+| `RSS_RUNS_LIMIT` | 10 | default row count for `runs` |
 | `RSS_FETCH_WORKERS` | 6 | concurrent feed fetches |
 | `RSS_SKIP_KEYWORDS` | built-in sports/entertainment list | skip filter |
 | `RSS_PY_PYTHON` | `python3` | interpreter path (venv) |

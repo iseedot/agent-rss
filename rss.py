@@ -1320,6 +1320,47 @@ def _ledger_snapshot(limit_facts: int = 80, limit_opinions: int = 30) -> dict:
     }
 
 
+def _compact(value: Any) -> Any:
+    """Drop empty fields so the payload carries no dead weight for the model."""
+    if isinstance(value, dict):
+        return {k: _compact(v) for k, v in value.items()
+                if v is not None and v != "" and v != [] and v != {}}
+    if isinstance(value, list):
+        return [_compact(v) for v in value]
+    return value
+
+
+def _ledger_referenced(fact_ids: set[int], opinion_ids: set[int]) -> dict:
+    """Payload ledger: all unconfirmed facts plus only the previous facts/opinions
+    that this period's candidates actually reference (via repeat_of / related_to_o<id>)."""
+    conn = get_conn()
+    try:
+        unconfirmed = conn.execute(
+            """SELECT id, text, status FROM rss_ledger_facts
+               WHERE status = 'unconfirmed' ORDER BY updated_at DESC LIMIT 50""").fetchall()
+        facts = []
+        if fact_ids:
+            placeholders = ",".join("?" for _ in fact_ids)
+            facts = conn.execute(
+                f"SELECT id, text, status FROM rss_ledger_facts WHERE id IN ({placeholders})",
+                list(fact_ids)).fetchall()
+        opinions = []
+        if opinion_ids:
+            placeholders = ",".join("?" for _ in opinion_ids)
+            opinions = conn.execute(
+                f"""SELECT id, source, claim, evidence, checks, conclusion, trend, signal,
+                           time_window, change FROM rss_ledger_opinions
+                    WHERE id IN ({placeholders}) AND status = 'active'""",
+                list(opinion_ids)).fetchall()
+    finally:
+        conn.close()
+    return {
+        "prev_facts": [_compact(dict(r)) for r in facts],
+        "unconfirmed": [_compact(dict(r)) for r in unconfirmed],
+        "active_opinions": [_compact(dict(r)) for r in opinions],
+    }
+
+
 def _ledger_upsert_facts(parsed: dict, run_id: int) -> dict:
     added = updated = 0
     conn = get_conn()
@@ -1490,9 +1531,22 @@ def _retire_stale_opinions(run_id: int, after_periods: Optional[int] = None) -> 
         conn.close()
 
 
+def _numbers_conflict(a: Optional[list], b: Optional[list]) -> bool:
+    """True when both sides carry numbers and neither set contains the other.
+    Similar headlines with different values (2.9% vs 3.1%) must not be merged."""
+    sa = {str(n).replace(" ", "") for n in (a or [])}
+    sb = {str(n).replace(" ", "") for n in (b or [])}
+    if not sa or not sb:
+        return False
+    return not (sa <= sb or sb <= sa)
+
+
 def _group_facts(facts: list[dict], threshold: float = 0.62) -> list[dict]:
     """Merge same-event facts from different sources into one candidate
-    (representative keeps the best value, dup_count/dup_sources expose the rest)."""
+    (representative keeps the best value, dup_count/dup_sources expose the rest).
+
+    Guards: facts with conflicting numbers or different topics are never merged.
+    """
     groups: list[list[dict]] = []
     keys: list[str] = []
     for fact in facts:
@@ -1500,6 +1554,12 @@ def _group_facts(facts: list[dict], threshold: float = 0.62) -> list[dict]:
         placed = False
         for idx, existing in enumerate(keys):
             if not existing or not key:
+                continue
+            head = groups[idx][0]
+            if (fact.get("topic") and head.get("topic")
+                    and fact["topic"] != head["topic"]):
+                continue
+            if _numbers_conflict(fact.get("numbers"), head.get("numbers")):
                 continue
             if difflib.SequenceMatcher(None, key, existing).ratio() >= threshold:
                 groups[idx].append(fact)
@@ -1757,13 +1817,17 @@ def cmd_payload(run_id: Optional[int] = None) -> tuple[str, dict]:
     finally:
         conn.close()
 
-    facts_max = _env_int("RSS_BRIEF_FACTS_MAX", 60, 1, 500)
-    op_top = _env_int("RSS_BRIEF_OPINION_TOP", 10, 1, 100)
-    op_chars = _env_int("RSS_BRIEF_OPINION_CHARS", 1200, 100, 10000)
+    facts_max = _env_int("RSS_BRIEF_FACTS_MAX", 40, 1, 500)
+    op_top = _env_int("RSS_BRIEF_OPINION_TOP", 8, 1, 100)
+    op_chars = _env_int("RSS_BRIEF_OPINION_CHARS", 800, 100, 10000)
+    fact_chars = _env_int("RSS_BRIEF_FACT_CHARS", 200, 50, 2000)
     none_conf = _env_float("RSS_JE_V_NONE_CONF", 0.7)
     facts: list[dict] = []
     opinions: list[dict] = []
     dropped_none = 0
+    referenced_facts: set[int] = set()
+    referenced_opinions: set[int] = set()
+    related_flag_prefix = "related_to_o"
     for row in rows:
         if row["is_skipped"]:
             continue
@@ -1771,6 +1835,18 @@ def cmd_payload(run_id: Optional[int] = None) -> tuple[str, dict]:
             triage = json.loads(row["triage_json"]) if row["triage_json"] else {}
         except Exception:
             triage = {}
+        flags = list(triage.get("flags") or [])
+        if triage.get("repeat_of"):
+            try:
+                referenced_facts.add(int(triage["repeat_of"]))
+            except (TypeError, ValueError):
+                pass
+        for flag in flags:
+            if isinstance(flag, str) and flag.startswith(related_flag_prefix):
+                try:
+                    referenced_opinions.add(int(flag[len(related_flag_prefix):]))
+                except ValueError:
+                    pass
         kind = row["kind"] or triage.get("kind") or "fact"
         base = {
             "id": row["id"], "title": row["title"],
@@ -1778,14 +1854,19 @@ def cmd_payload(run_id: Optional[int] = None) -> tuple[str, dict]:
             "published_bj": _fmt_bj(row["published"] or row["created_at"]),
             "topic": row["topic"] or "其他", "has_number": bool(row["has_number"]),
             "numbers": triage.get("numbers", []), "value": triage.get("value", 5),
-            "flags": triage.get("flags", []),
+            "flags": flags,
         }
         if triage.get("repeat_of"):
             base["repeat_of"] = triage["repeat_of"]
         if "new_number" in triage:
             base["new_number"] = triage["new_number"]
         if kind in ("fact", "mixed"):
-            facts.append(dict(base, summary=_to_text(row["summary"] or row["content"], 300)))
+            # 无新数字的重复事实只给标题；正文用上期台账那条。
+            if "repeat_no_new_number" in flags:
+                facts.append(_compact(base))
+            else:
+                facts.append(_compact(dict(
+                    base, summary=_to_text(row["summary"] or row["content"], fact_chars))))
         if kind in ("opinion", "mixed"):
             relation = triage.get("relation") or "new"
             relation_conf = float(triage.get("relation_confidence") or 0.0)
@@ -1796,10 +1877,9 @@ def cmd_payload(run_id: Optional[int] = None) -> tuple[str, dict]:
                     dropped_none += 1
                     continue
                 relation = "new"
-                triage_flags = list(base.get("flags") or [])
-                if "relation_uncertain" not in triage_flags:
-                    triage_flags.append("relation_uncertain")
-                base["flags"] = triage_flags
+                if "relation_uncertain" not in flags:
+                    flags.append("relation_uncertain")
+                base["flags"] = flags
             entry = dict(
                 base, source=_source_from_feed(row["_feed_title"]),
                 text=_to_text(row["content"] or row["summary"], op_chars),
@@ -1808,32 +1888,43 @@ def cmd_payload(run_id: Optional[int] = None) -> tuple[str, dict]:
                 verify_needed=bool(row["verify_needed"]))
             if relation_conf:
                 entry["relation_confidence"] = round(relation_conf, 3)
-            opinions.append(entry)
+            opinions.append(_compact(entry))
 
     facts_total, opinions_total = len(facts), len(opinions)
     facts = _group_facts(facts)
     facts = sorted(facts, key=lambda x: (-int(x["value"] or 0), x["published_bj"]))[:facts_max]
     opinions = sorted(opinions, key=lambda x: -int(x["value"] or 0))[:op_top]
+    ledger = _ledger_referenced(referenced_facts, referenced_opinions)
+
+    # last_report 只在冷启动（台账为空）或 RSS_BRIEF_INCLUDE_LAST_REPORT=1 时附全文。
+    include_env = (os.getenv("RSS_BRIEF_INCLUDE_LAST_REPORT") or "").strip()
+    ledger_cold = not (ledger["prev_facts"] or ledger["active_opinions"])
+    include_last = include_env == "1" or (include_env == "" and ledger_cold)
     prev_name = run["prev_report"] or ""
-    prev_text = ""
-    if prev_name:
-        prev_text = _read_report(_report_dir() / prev_name)[1]
     if not prev_name:
-        prev_name, prev_text = _read_report(_prev_report(run["report_name"] or ""))
+        prev_name, _ = _read_report(_prev_report(run["report_name"] or ""))
+    prev_text = ""
+    if include_last and prev_name:
+        prev_text = _read_report(_report_dir() / prev_name)[1]
+
     data = {
         "run_id": rid,
         "session": {"slot": run["slot"], "report_name": run["report_name"],
                     "prev_report": run["prev_report"] or "无"},
-        "counts": {"fetched_new": run["fetched_new"], "briefed": run["briefed"], 
+        "counts": {"fetched_new": run["fetched_new"], "briefed": run["briefed"],
                    "facts_total": facts_total, "opinions_total": opinions_total,
+                   "facts_omitted": max(0, facts_total - len(facts)),
                    "opinions_omitted": max(0, opinions_total - dropped_none - len(opinions)),
-                   "opinions_dropped_no_change": dropped_none},
+                   "opinions_dropped_no_change": dropped_none,
+                   "last_report_included": bool(prev_text)},
         "facts": facts,
         "opinions": opinions,
-        "ledger": _ledger_snapshot(),
+        "ledger": ledger,
         "last_report": {"name": prev_name or "无", "text": prev_text},
         "next_steps": [
             "只用本 payload 写草稿：速览行 ≤40 字、观点六字段、观点 ≤3 条、全文 ≤2500 汉字",
+            "速览区只用「- 」列表行；**小标题**/### 小标题只作分组，不计条数、不入台账",
+            "ledger 只列出被本期候选引用到的上期事实/观点；需要更多用 rss action=ledger 查询",
             "写完调用 rss {action: qa, draft: <草稿>}，按 violations 修正",
             "调用 rss {action: commit, body: <修订稿>}，最终只输出返回的 reportText",
         ],
@@ -2026,6 +2117,138 @@ def cmd_ledger() -> tuple[str, dict]:
     return text, snapshot
 
 
+def cmd_runstats(payload: Any) -> tuple[str, dict]:
+    if not isinstance(payload, dict):
+        return "❌ runstats expects a JSON object on stdin", {"updated": 0}
+    run = _get_run(payload.get("run_id"))
+    if run is None:
+        return "❌ No run found", {"updated": 0}
+    rid = int(run["id"])
+    merged: dict = {}
+    if run["jev_stats"]:
+        try:
+            merged = json.loads(run["jev_stats"]) or {}
+        except Exception:
+            merged = {}
+    for key, value in (payload.get("jev_stats") or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = {**merged[key], **value}
+        else:
+            merged[key] = value
+    fields: dict = {"jev_stats": json.dumps(merged, ensure_ascii=False)}
+    if payload.get("websearch_used") is not None:
+        fields["websearch_used"] = int(payload["websearch_used"] or 0)
+    _update_run(rid, **fields)
+    return f"✅ Run {rid} stats updated", {"run_id": rid, "jev_stats": merged}
+
+
+def cmd_runs(limit: int = 10) -> tuple[str, dict]:
+    limit = _env_int("RSS_RUNS_LIMIT", int(limit or 10), 1, 200)
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT id, slot, slot_date, report_name, status, fetched_new, briefed,
+                      facts_used, opinions_used, websearch_used, jev_stats,
+                      started_at, finished_at, violations
+               FROM rss_runs ORDER BY id DESC LIMIT ?""", (limit,)).fetchall()
+    finally:
+        conn.close()
+    runs: list[dict] = []
+    lines = [f"📈 Runs ({len(rows)})"]
+    for row in rows:
+        item = dict(row)
+        item["duration_s"] = (int(row["finished_at"]) - int(row["started_at"])
+                              if row["finished_at"] and row["started_at"] else None)
+        stats: dict = {}
+        if row["jev_stats"]:
+            try:
+                stats = json.loads(row["jev_stats"]) or {}
+            except Exception:
+                stats = {}
+        triage = stats.get("triage") or {}
+        usage = triage.get("usage") or {}
+        item["jev_stats"] = stats or None
+        try:
+            item["violations"] = json.loads(row["violations"]) if row["violations"] else []
+        except Exception:
+            item["violations"] = []
+        runs.append(item)
+        cost = usage.get("cost_usd")
+        tokens = usage.get("total_tokens")
+        lines.append(
+            f"  run {row['id']} {row['slot_date'] or '-'} {row['slot'] or '-'} [{row['status'] or '-'}] "
+            f"{item['duration_s'] if item['duration_s'] is not None else '-'}s | "
+            f"new {row['fetched_new'] or 0} | briefed {row['briefed'] or 0} | "
+            f"used {row['facts_used'] or 0}f/{row['opinions_used'] or 0}o | "
+            f"web {row['websearch_used'] or 0} | jev {triage.get('calls', '-')} calls"
+            + (f" | {tokens} tok" if tokens else "")
+            + (f" | ${cost:.6f}" if isinstance(cost, (int, float)) and cost else "")
+        )
+    return "\n".join(lines), {"runs": runs}
+
+
+def cmd_backfill(files: Optional[list[str]] = None, last: int = 0,
+                 dry_run: bool = False) -> tuple[str, dict]:
+    """Seed the ledger from existing report files (cold-start recovery).
+
+    Each file becomes a run row with status='backfilled' so retirement windows and
+    run history stay coherent; nothing is marked read.
+    """
+    targets: list[Path] = []
+    if files:
+        targets = [Path(f).expanduser() for f in files]
+    elif last:
+        targets = _list_reports()[-last:]
+    targets = [p for p in targets if p.exists()]
+    totals = {"files": 0, "facts_added": 0, "facts_updated": 0,
+              "opinions_added": 0, "opinions_updated": 0}
+    details: list[dict] = []
+    if not targets:
+        return "❌ No report files found", {**totals, "details": details}
+    if dry_run:
+        for path in targets:
+            parsed, _ = _validate_report(path.read_text(encoding="utf-8"))
+            details.append({
+                "file": path.name,
+                "facts": len([f for f in parsed["facts"] if not f["continuation"]]),
+                "continuations": len([f for f in parsed["facts"] if f["continuation"]]),
+                "opinions": len(parsed["opinions"]),
+            })
+        return (f"🔍 Dry-run: {len(targets)} file(s); " + "; ".join(
+            f"{d['file']} facts={d['facts']} cont={d['continuations']} opinions={d['opinions']}"
+            for d in details)), {**totals, "details": details}
+
+    conn = get_conn()
+    try:
+        for path in targets:
+            parsed, _ = _validate_report(path.read_text(encoding="utf-8"))
+            match = re.match(r"^(\d{2})-(\d{2})_(\d{2})\.md$", path.name)
+            today = _bj_now()
+            slot_date = (f"{today.year}-{match.group(1)}-{match.group(2)}"
+                         if match else today.strftime("%Y-%m-%d"))
+            slot = "morning" if match and int(match.group(3)) < 12 else "evening"
+            cur = conn.execute(
+                """INSERT INTO rss_runs (slot, slot_date, report_name, prev_report, fetched_new,
+                   briefed, facts_used, opinions_used, status, websearch_used, started_at, finished_at)
+                   VALUES (?, ?, ?, NULL, 0, 0, 0, 0, 'backfilled', 0, ?, ?)""",
+                (slot, slot_date, path.name, int(time.time()), int(time.time())))
+            rid = int(cur.lastrowid)
+            conn.commit()
+            ledger: dict = {}
+            ledger.update(_ledger_upsert_facts(parsed, rid))
+            ledger.update(_ledger_upsert_opinions(parsed, rid))
+            for key in ("facts_added", "facts_updated", "opinions_added", "opinions_updated"):
+                totals[key] += int(ledger.get(key, 0))
+            totals["files"] += 1
+            details.append({"file": path.name, "run_id": rid, **ledger})
+    finally:
+        conn.close()
+    text = "✅ Backfilled: " + "; ".join(
+        f"{d['file']} +{d.get('facts_added', 0)}f/+{d.get('opinions_added', 0)}o"
+        for d in details)
+    return text, {**totals, "details": details}
+
+
 def mark_read_ids(ids: list[int]) -> int:
     ids = [int(i) for i in ids if i]
     if not ids:
@@ -2164,6 +2387,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--n", type=int, default=50, help="Sample size (default 50)")
     p.add_argument("--unread", action="store_true", help="Sample unread items only")
     p.set_defaults(func=lambda a: cmd_sample(a.n, a.unread))
+
+    p = sub.add_parser("runstats", parents=[common],
+                       help="Merge per-run stats (JSON {run_id?, jev_stats?, websearch_used?} on stdin)")
+    p.set_defaults(func=lambda a: cmd_runstats(_read_stdin_json(default={})))
+
+    p = sub.add_parser("runs", parents=[common], help="Recent run records with jev usage")
+    p.add_argument("--limit", type=int, default=10)
+    p.set_defaults(func=lambda a: cmd_runs(a.limit))
+
+    p = sub.add_parser("backfill", parents=[common],
+                       help="Backfill the ledger from existing report files")
+    p.add_argument("--file", action="append", default=None, help="Report file (repeatable)")
+    p.add_argument("--last", type=int, default=0, help="Backfill the last N reports from RSS_REPORT_DIR")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=lambda a: cmd_backfill(a.file or [], a.last, a.dry_run))
 
     return parser
 

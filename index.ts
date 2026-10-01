@@ -323,6 +323,17 @@ const RELATION_HINTS: Record<string, string> = {
   na: "",
 };
 
+type TriageUsage = { input: number; output: number; totalTokens: number; costTotal: number };
+
+const emptyUsage = (): TriageUsage => ({ input: 0, output: 0, totalTokens: 0, costTotal: 0 });
+
+const mergeUsage = (a: TriageUsage, b: TriageUsage): TriageUsage => ({
+  input: a.input + b.input,
+  output: a.output + b.output,
+  totalTokens: a.totalTokens + b.totalTokens,
+  costTotal: a.costTotal + b.costTotal,
+});
+
 type TriageResult = {
   annotations: TriageAnnotation[];
   mode: "jev" | "partial" | "heuristic";
@@ -330,6 +341,9 @@ type TriageResult = {
   reason?: string;
   batches: number;
   failures: number;
+  usage: TriageUsage;
+  passBatches: { kind: number; relation: number; repeat: number };
+  classifierCalls: number;
 };
 
 async function runJevTriage(
@@ -339,18 +353,15 @@ async function runJevTriage(
   deadlineMs: number,
 ): Promise<TriageResult> {
   const resolved = resolveJevModel(ctx);
+  const emptyTriage = (mode: "heuristic", reason: string, model?: string): TriageResult => ({
+    annotations: [], mode, ...(model ? { model } : {}), reason, batches: 0, failures: 0,
+    usage: emptyUsage(), passBatches: { kind: 0, relation: 0, repeat: 0 }, classifierCalls: 0,
+  });
   if (!resolved.model) {
-    return { annotations: [], mode: "heuristic", reason: resolved.reason, batches: 0, failures: 0 };
+    return emptyTriage("heuristic", resolved.reason ?? "classifier not found");
   }
   if (!ctx.modelRegistry.hasConfiguredAuth(resolved.model)) {
-    return {
-      annotations: [],
-      mode: "heuristic",
-      model: resolved.spec,
-      reason: "no credentials for classifier",
-      batches: 0,
-      failures: 0,
-    };
+    return emptyTriage("heuristic", "no credentials for classifier", resolved.spec);
   }
   const batchSize = clampInt(process.env.RSS_JE_V_BATCH, 10, 1, 20);
   const concurrency = clampInt(process.env.RSS_JE_V_CONCURRENCY, 4, 1, 8);
@@ -360,6 +371,18 @@ async function runJevTriage(
   const info = new Map<number, TriageAnnotation>();
   let batches = 0;
   let failures = 0;
+  const usage = emptyUsage();
+  const passBatches = { kind: 0, relation: 0, repeat: 0 };
+  let classifierCalls = 0;
+  const noteUsage = (res: any) => {
+    classifierCalls += 1;
+    const u = res?.usage;
+    if (!u) return;
+    usage.input += Number(u.input ?? 0);
+    usage.output += Number(u.output ?? 0);
+    usage.totalTokens += Number(u.totalTokens ?? 0);
+    usage.costTotal += Number(u?.cost?.total ?? 0);
+  };
   const timedOut = () => Date.now() > deadline;
 
   const boolQ = (instructions: string) => ({
@@ -372,6 +395,7 @@ async function runJevTriage(
   await mapLimit(chunk(items, batchSize), concurrency, async (batch) => {
     if (timedOut()) return;
     batches += 1;
+    passBatches.kind += 1;
     const state: any = { items: {} };
     const questions: any = {};
     batch.forEach((it, k) => {
@@ -426,6 +450,7 @@ async function runJevTriage(
       failures += 1;
       return;
     }
+    noteUsage(res);
     batch.forEach((it, k) => {
       const p = `i${k}`;
       const a = res.answers ?? {};
@@ -453,6 +478,7 @@ async function runJevTriage(
     await mapLimit(chunk(opinionItems, Math.min(batchSize, 8)), concurrency, async (batch) => {
       if (timedOut()) return;
       batches += 1;
+      passBatches.relation += 1;
       const state: any = {
         active_opinions: active.map((o) => ({
           id: `o${o.id}`,
@@ -501,6 +527,7 @@ async function runJevTriage(
         failures += 1;
         return;
       }
+      noteUsage(res);
       batch.forEach((it, k) => {
         const entry = info.get(it.id);
         if (!entry) return;
@@ -528,6 +555,7 @@ async function runJevTriage(
     await mapLimit(chunk(factItems, Math.min(batchSize, 8)), concurrency, async (batch) => {
       if (timedOut()) return;
       batches += 1;
+      passBatches.repeat += 1;
       const state: any = {
         prev_facts: prevFacts.map((f) => ({ id: `f${f.id}`, text: f.text })),
         items: {},
@@ -553,6 +581,7 @@ async function runJevTriage(
         failures += 1;
         return;
       }
+      noteUsage(res);
       batch.forEach((it, k) => {
         const entry = info.get(it.id);
         if (!entry) return;
@@ -601,6 +630,9 @@ async function runJevTriage(
     batches,
     failures,
     reason: failures ? `${failures} classifier batch(es) failed` : undefined,
+    usage,
+    passBatches,
+    classifierCalls,
   };
 }
 
@@ -610,10 +642,30 @@ async function runJevLint(
   ctx: ClassifierCtx,
   draft: string,
   deadlineMs: number,
-): Promise<{ violations: { line: number; kind: string; why: string }[]; used: boolean; reason?: string }> {
+): Promise<{
+  violations: { line: number; kind: string; why: string }[];
+  used: boolean;
+  reason?: string;
+  usage: TriageUsage;
+  calls: number;
+}> {
   const resolved = resolveJevModel(ctx);
+  const usage = emptyUsage();
+  let calls = 0;
+  const noteUsage = (res: any) => {
+    calls += 1;
+    const u = res?.usage;
+    if (!u) return;
+    usage.input += Number(u.input ?? 0);
+    usage.output += Number(u.output ?? 0);
+    usage.totalTokens += Number(u.totalTokens ?? 0);
+    usage.costTotal += Number(u?.cost?.total ?? 0);
+  };
   if (!resolved.model || !ctx.modelRegistry.hasConfiguredAuth(resolved.model)) {
-    return { violations: [], used: false, reason: resolved.reason ?? "classifier unavailable" };
+    return {
+      violations: [], used: false, usage, calls,
+      reason: resolved.reason ?? "classifier unavailable",
+    };
   }
   const concurrency = clampInt(process.env.RSS_JE_V_CONCURRENCY, 4, 1, 8);
   const deadline = Date.now() + Math.max(15_000, deadlineMs);
@@ -681,6 +733,7 @@ async function runJevLint(
     });
     const res = await classifyWithRetry(ctx, resolved.model, { state, questions }, deadline);
     if (!res) return;
+    noteUsage(res);
     batch.forEach((m, k) => {
       const p = `l${k}`;
       const a = res.answers ?? {};
@@ -695,7 +748,7 @@ async function runJevLint(
     });
   });
 
-  return { violations, used: true };
+  return { violations, used: true, usage, calls };
 }
 
 // ---- web verification (qa stage, hard budget) ----
@@ -735,12 +788,16 @@ async function runVerification(
   used: number;
   budget: number;
   unavailable?: boolean;
+  usage: TriageUsage;
+  calls: number;
 }> {
   const budget = clampInt(process.env.RSS_VERIFY_BUDGET, 4, 0, 8);
   const entries: any[] = [];
-  if (budget === 0) return { entries, used: 0, budget };
+  const usage = emptyUsage();
+  let calls = 0;
+  if (budget === 0) return { entries, used: 0, budget, usage, calls };
   const targets = extractVerificationTargets(draft);
-  if (!targets.length) return { entries, used: 0, budget };
+  if (!targets.length) return { entries, used: 0, budget, usage, calls };
 
   const resolved = resolveJevModel(ctx);
   const canClassify = !!resolved.model && ctx.modelRegistry.hasConfiguredAuth(resolved.model);
@@ -756,10 +813,10 @@ async function runVerification(
         numResults: 5,
       });
     } catch {
-      return { entries, used: entries.length, budget, unavailable: true };
+      return { entries, used: entries.length, budget, unavailable: true, usage, calls };
     }
     if (outcome?.isError) {
-      return { entries, used: entries.length, budget, unavailable: true };
+      return { entries, used: entries.length, budget, unavailable: true, usage, calls };
     }
     const evidence = toolResultToText(outcome.result);
     const entry: any = {
@@ -798,6 +855,14 @@ async function runVerification(
         deadline,
       );
       if (res) {
+        calls += 1;
+        const u = res.usage;
+        if (u) {
+          usage.input += Number(u.input ?? 0);
+          usage.output += Number(u.output ?? 0);
+          usage.totalTokens += Number(u.totalTokens ?? 0);
+          usage.costTotal += Number(u?.cost?.total ?? 0);
+        }
         entry.verdict = res.answers?.verdict?.choice ?? "insufficient";
         entry.verdict_confidence = res.answers?.verdict?.confidence;
         const counter = res.answers?.counter?.choice;
@@ -806,7 +871,7 @@ async function runVerification(
     }
     entries.push(entry);
   }
-  return { entries, used: entries.length, budget };
+  return { entries, used: entries.length, budget, usage, calls };
 }
 
 // ---- calibration (Chinese quality gate) ----
@@ -911,6 +976,8 @@ function formatViolations(violations: any[]): string {
 
 /** Web searches used by the last `qa` call, recorded by the following `commit`. */
 let pendingVerifyUsed = 0;
+/** Run id created by the last `brief`, so `qa` can attach its stats to the same run. */
+let currentRunId: number | null = null;
 
 const rssTool = defineTool({
   name: "rss",
@@ -929,7 +996,7 @@ const rssTool = defineTool({
     "3) commit: final gate. Validates, builds the header line, saves RSS_REPORT_DIR/MM-DD_hh.md " +
     "(Beijing time), updates the fact/opinion ledger, marks this batch as read, and returns the " +
     "final report text. Reply with exactly that text.\n" +
-    "BASIC: fetch, unread, markread. ADMIN: manage op=add|remove|list|tag|tags|stats. " +
+    "BASIC: fetch, unread, markread. ADMIN: manage op=add|remove|list|tag|tags|stats|runs|backfill. " +
     "CALIBRATION: calibrate op=sample|score (checks whether jev handles Chinese well enough " +
     "before trusting its discard decisions).",
   parameters: Type.Object({
@@ -941,7 +1008,7 @@ const rssTool = defineTool({
         Type.Literal("fetch", { description: "Fetch all subscriptions now" }),
         Type.Literal("unread", { description: "List unread items (human/debug)" }),
         Type.Literal("markread", { description: "Mark items read: ids, item_id, tag, older_than, before" }),
-        Type.Literal("manage", { description: "Admin: op=add|remove|list|tag|tags|stats" }),
+        Type.Literal("manage", { description: "Admin: op=add|remove|list|tag|tags|stats|runs|backfill" }),
         Type.Literal("calibrate", { description: "jev Chinese calibration: op=sample|score" }),
       ],
       { description: "Pipeline stage or maintenance action" },
@@ -968,6 +1035,8 @@ const rssTool = defineTool({
           Type.Literal("stats"),
           Type.Literal("sample"),
           Type.Literal("score"),
+          Type.Literal("runs"),
+          Type.Literal("backfill"),
         ],
         { description: "manage/calibrate sub-operation" },
       ),
@@ -975,6 +1044,8 @@ const rssTool = defineTool({
     feed_url: Type.Optional(Type.String({ description: "manage add: feed URL" })),
     feed_id: Type.Optional(Type.Integer({ description: "manage remove/tag: feed ID" })),
     tags: Type.Optional(Type.String({ description: "manage add/tag: comma-separated tags" })),
+    file: Type.Optional(Type.String({ description: "manage backfill: report file path" })),
+    last: Type.Optional(Type.Integer({ description: "manage backfill: backfill the last N reports" })),
     item_id: Type.Optional(Type.Integer({ description: "markread: single item ID" })),
     ids: Type.Optional(Type.String({ description: "markread: comma-separated item IDs" })),
     tag: Type.Optional(Type.String({ description: "unread/markread/manage list: tag filter" })),
@@ -1013,12 +1084,36 @@ const rssTool = defineTool({
             reason: `classifier error: ${err?.message ?? err}`,
             batches: 0,
             failures: 0,
+            usage: emptyUsage(),
+            passBatches: { kind: 0, relation: 0, repeat: 0 },
+            classifierCalls: 0,
           };
         }
+        currentRunId = runId;
         if (triage.annotations.length) {
           const ann = await runPyJson(["annotate", "--json"], JSON.stringify(triage.annotations));
           if (!ann.ok) console.error(`[rss] annotate failed: ${ann.error}`);
         }
+        const statsRes = await runPyJson(["runstats", "--json"], JSON.stringify({
+          run_id: runId,
+          jev_stats: {
+            triage: {
+              mode: triage.mode,
+              model: triage.model ?? null,
+              calls: triage.classifierCalls,
+              batches: triage.passBatches,
+              failures: triage.failures,
+              classified: triage.annotations.length,
+              usage: {
+                input_tokens: triage.usage.input,
+                output_tokens: triage.usage.output,
+                total_tokens: triage.usage.totalTokens,
+                cost_usd: Number(triage.usage.costTotal.toFixed(6)),
+              },
+            },
+          },
+        }));
+        if (!statsRes.ok) console.error(`[rss] runstats failed: ${statsRes.error}`);
 
         const payload = await runPyJson(["payload", "--json", "--run", String(runId)]);
         if (!payload.ok) return errResult("brief", `❌ payload failed: ${payload.error ?? "unknown"}`);
@@ -1055,7 +1150,10 @@ const rssTool = defineTool({
         try {
           lint = await runJevLint(ctx, params.draft, deadlineMs);
         } catch (err: any) {
-          lint = { violations: [], used: false, reason: `classifier error: ${err?.message ?? err}` };
+          lint = {
+            violations: [], used: false, usage: emptyUsage(), calls: 0,
+            reason: `classifier error: ${err?.message ?? err}`,
+          };
         }
         violations.push(...lint.violations);
         let verification: Awaited<ReturnType<typeof runVerification>>;
@@ -1067,9 +1165,38 @@ const rssTool = defineTool({
             used: 0,
             budget: clampInt(process.env.RSS_VERIFY_BUDGET, 4, 0, 8),
             unavailable: true,
+            usage: emptyUsage(),
+            calls: 0,
           };
         }
         pendingVerifyUsed = verification.used;
+        if (currentRunId != null) {
+          const qaUsage = mergeUsage(lint.usage, verification.usage);
+          const qaStats = await runPyJson(["runstats", "--json"], JSON.stringify({
+            run_id: currentRunId,
+            jev_stats: {
+              qa: {
+                lint: {
+                  used: lint.used, calls: lint.calls, violations: lint.violations.length,
+                  reason: lint.reason ?? null,
+                },
+                verification: {
+                  used: verification.used,
+                  budget: verification.budget,
+                  unavailable: verification.unavailable ?? false,
+                  calls: verification.calls,
+                },
+                usage: {
+                  input_tokens: qaUsage.input,
+                  output_tokens: qaUsage.output,
+                  total_tokens: qaUsage.totalTokens,
+                  cost_usd: Number(qaUsage.costTotal.toFixed(6)),
+                },
+              },
+            },
+          }));
+          if (!qaStats.ok) console.error(`[rss] runstats failed: ${qaStats.error}`);
+        }
 
         data.violations = violations;
         data.verification = verification.entries;
@@ -1273,8 +1400,8 @@ const rssTool = defineTool({
       // ---------------------------------------------------------------- Admin
       case "manage": {
         const op = params.op;
-        if (!op || !["add", "remove", "list", "tag", "tags", "stats"].includes(op)) {
-          return errResult("manage", "❌ action=manage requires op=add|remove|list|tag|tags|stats");
+        if (!op || !["add", "remove", "list", "tag", "tags", "stats", "runs", "backfill"].includes(op)) {
+          return errResult("manage", "❌ action=manage requires op=add|remove|list|tag|tags|stats|runs|backfill");
         }
         let args: string[] = [];
         if (op === "add") {
@@ -1295,6 +1422,12 @@ const rssTool = defineTool({
           args = ["tags"];
         } else if (op === "stats") {
           args = ["stats"];
+        } else if (op === "runs") {
+          args = ["runs", "--limit", String(params.limit ?? 10)];
+        } else if (op === "backfill") {
+          args = ["backfill"];
+          if (params.file) args.push("--file", params.file);
+          if (params.last != null) args.push("--last", String(params.last));
         }
         const { stdout, stderr } = await runPy(args);
         return okResult("manage", (stdout || stderr).trim() || "(no output)");
