@@ -1924,7 +1924,7 @@ def cmd_payload(run_id: Optional[int] = None) -> tuple[str, dict]:
         "next_steps": [
             "只用本 payload 写草稿：速览行 ≤40 字、观点六字段、观点 ≤3 条、全文 ≤2500 汉字",
             "速览区只用「- 」列表行；**小标题**/### 小标题只作分组，不计条数、不入台账",
-            "ledger 只列出被本期候选引用到的上期事实/观点；需要更多用 rss action=ledger 查询",
+            "ledger 只列出被本期候选引用到的上期事实/观点；需要更多用 rss action=manage op=ledger 查询",
             "写完调用 rss {action: qa, draft: <草稿>}，按 violations 修正",
             "调用 rss {action: commit, body: <修订稿>}，最终只输出返回的 reportText",
         ],
@@ -2037,10 +2037,11 @@ def cmd_commit(body: str, run_id: Optional[int] = None, strict: bool = True,
                                          "violations": [{"line": 0, "kind": "state",
                                                          "why": "没有可提交的 brief run"}]}
     if run_id is None:
-        if run["status"] == "committed":
-            return "❌ Latest run already committed", {"ok": False, "violations": [
+        if run["status"] != "briefed":
+            return "❌ Latest run is not a fresh brief", {"ok": False, "violations": [
                 {"line": 0, "kind": "state",
-                 "why": "最近一次 run 已提交；请先执行 brief 开始新一期（或显式传 run_id 补提）"}]}
+                 "why": (f"最近一次 run 状态为 {run['status'] or '未知'}（不是 briefed）；"
+                         "请先执行 brief 开始新一期（或显式传 run_id 强制提交）")}]}
         yesterday = (_bj_now() - timedelta(days=1)).strftime("%Y-%m-%d")
         if (run["slot_date"] or "") < yesterday:
             return "❌ Latest run is stale", {"ok": False, "violations": [

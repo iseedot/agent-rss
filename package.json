@@ -1,6 +1,6 @@
 {
   "name": "pi-agent-rss",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "license": "MIT",
   "type": "module",
   "description": "RSS report engine for pi: brief/qa/commit pipeline for scheduled facts+opinions digests, jev triage ready, plus basic fetch/unread/markread and feed management",

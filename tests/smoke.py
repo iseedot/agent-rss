@@ -128,6 +128,12 @@ def main() -> int:
         check("no-change opinion dropped", payload["counts"]["opinions_dropped_no_change"] == 1)
         nvidia = next(f for f in payload["facts"] if "英伟达" in f["title"])
         check("cross-source facts grouped", nvidia.get("dup_count") == 1 and nvidia.get("dup_sources"))
+        check("next_steps point to a real action",
+              "manage op=ledger" in " ".join(payload["next_steps"]), str(payload["next_steps"]))
+        ledger_env = run_json(["ledger"], env=env)
+        check("ledger command available",
+              ledger_env["ok"] is True and "prev_facts" in (ledger_env["data"] or {}),
+              str(ledger_env)[:120])
 
         print("check / commit:")
         body = (
@@ -300,6 +306,11 @@ def main() -> int:
         check("backfill run recorded", conn2.execute(
             "SELECT COUNT(*) c FROM rss_runs WHERE status = 'backfilled'").fetchone()[0] == 1)
         conn2.close()
+        blocked = run_json(["commit"], stdin=json.dumps({"body": body}), env=env)
+        check("commit rejects non-briefed latest run",
+              blocked["data"]["ok"] is False
+              and any("briefed" in v.get("why", "") for v in blocked["data"]["violations"]),
+              str(blocked.get("data"))[:200])
 
         print("sample:")
         sample = run_json(["sample", "--n", "3"], env=env)["data"]

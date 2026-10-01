@@ -996,7 +996,7 @@ const rssTool = defineTool({
     "3) commit: final gate. Validates, builds the header line, saves RSS_REPORT_DIR/MM-DD_hh.md " +
     "(Beijing time), updates the fact/opinion ledger, marks this batch as read, and returns the " +
     "final report text. Reply with exactly that text.\n" +
-    "BASIC: fetch, unread, markread. ADMIN: manage op=add|remove|list|tag|tags|stats|runs|backfill. " +
+    "BASIC: fetch, unread, markread. ADMIN: manage op=add|remove|list|tag|tags|stats|ledger|runs|backfill. " +
     "CALIBRATION: calibrate op=sample|score (checks whether jev handles Chinese well enough " +
     "before trusting its discard decisions).",
   parameters: Type.Object({
@@ -1008,7 +1008,7 @@ const rssTool = defineTool({
         Type.Literal("fetch", { description: "Fetch all subscriptions now" }),
         Type.Literal("unread", { description: "List unread items (human/debug)" }),
         Type.Literal("markread", { description: "Mark items read: ids, item_id, tag, older_than, before" }),
-        Type.Literal("manage", { description: "Admin: op=add|remove|list|tag|tags|stats|runs|backfill" }),
+        Type.Literal("manage", { description: "Admin: op=add|remove|list|tag|tags|stats|ledger|runs|backfill" }),
         Type.Literal("calibrate", { description: "jev Chinese calibration: op=sample|score" }),
       ],
       { description: "Pipeline stage or maintenance action" },
@@ -1037,6 +1037,7 @@ const rssTool = defineTool({
           Type.Literal("score"),
           Type.Literal("runs"),
           Type.Literal("backfill"),
+          Type.Literal("ledger"),
         ],
         { description: "manage/calibrate sub-operation" },
       ),
@@ -1046,6 +1047,7 @@ const rssTool = defineTool({
     tags: Type.Optional(Type.String({ description: "manage add/tag: comma-separated tags" })),
     file: Type.Optional(Type.String({ description: "manage backfill: report file path" })),
     last: Type.Optional(Type.Integer({ description: "manage backfill: backfill the last N reports" })),
+    dry_run: Type.Optional(Type.Boolean({ description: "manage backfill: preview only, write nothing" })),
     item_id: Type.Optional(Type.Integer({ description: "markread: single item ID" })),
     ids: Type.Optional(Type.String({ description: "markread: comma-separated item IDs" })),
     tag: Type.Optional(Type.String({ description: "unread/markread/manage list: tag filter" })),
@@ -1400,8 +1402,8 @@ const rssTool = defineTool({
       // ---------------------------------------------------------------- Admin
       case "manage": {
         const op = params.op;
-        if (!op || !["add", "remove", "list", "tag", "tags", "stats", "runs", "backfill"].includes(op)) {
-          return errResult("manage", "❌ action=manage requires op=add|remove|list|tag|tags|stats|runs|backfill");
+        if (!op || !["add", "remove", "list", "tag", "tags", "stats", "ledger", "runs", "backfill"].includes(op)) {
+          return errResult("manage", "❌ action=manage requires op=add|remove|list|tag|tags|stats|ledger|runs|backfill");
         }
         let args: string[] = [];
         if (op === "add") {
@@ -1422,12 +1424,15 @@ const rssTool = defineTool({
           args = ["tags"];
         } else if (op === "stats") {
           args = ["stats"];
+        } else if (op === "ledger") {
+          args = ["ledger"];
         } else if (op === "runs") {
           args = ["runs", "--limit", String(params.limit ?? 10)];
         } else if (op === "backfill") {
           args = ["backfill"];
           if (params.file) args.push("--file", params.file);
           if (params.last != null) args.push("--last", String(params.last));
+          if (params.dry_run) args.push("--dry-run");
         }
         const { stdout, stderr } = await runPy(args);
         return okResult("manage", (stdout || stderr).trim() || "(no output)");

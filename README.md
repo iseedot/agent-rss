@@ -51,15 +51,16 @@ without a bullet are reported as structure violations by `qa`/`commit`.
 | `fetch` | fetch all subscriptions now |
 | `unread` | list unread items (tag/feed/limit filters) |
 | `markread` | mark read: `ids`, `item_id`, `tag`, `older_than`, `before` |
-| `manage` | `op` = add / remove / list / tag / tags / stats / runs / backfill |
+| `manage` | `op` = add / remove / list / tag / tags / stats / ledger / runs / backfill |
 | `calibrate` | jev Chinese quality gate: `op:"sample"` writes labeled-sample file, edit labels, `op:"score"` computes accuracy + confidence calibration |
 
 ## Cost visibility & cold-start backfill
 
 ```
-rss {action:"manage", op:"runs", limit:10}    # per-run duration, counts, jev calls/tokens/cost
-python3 rss.py backfill --last 2              # seed the ledger from existing reports (run once)
-python3 rss.py backfill --dry-run --last 2    # preview without writing
+rss {action:"manage", op:"runs", limit:10}                        # per-run duration, counts, jev calls/tokens/cost
+rss {action:"manage", op:"ledger"}                                # full fact/opinion ledger
+rss {action:"manage", op:"backfill", last:2, dry_run:true}       # preview ledger backfill
+rss {action:"manage", op:"backfill", last:2}                     # seed the ledger (run once)
 ```
 
 `brief` writes triage usage (calls, per-pass batches, tokens, cost) and `qa` writes lint/

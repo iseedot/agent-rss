@@ -85,9 +85,10 @@ Report pipeline (the scheduled task; use these three calls, nothing else):
 Ops helpers (run once / for monitoring):
 
 ```
-rss {action:"manage", op:"runs", limit:10}    # durations, counts, jev calls/tokens/cost
-python3 rss.py backfill --dry-run --last 2    # preview ledger backfill from old reports
-python3 rss.py backfill --last 2              # seed the ledger so 延续/repeat work immediately
+rss {action:"manage", op:"runs", limit:10}                       # durations, counts, jev calls/tokens/cost
+rss {action:"manage", op:"ledger"}                               # full fact/opinion ledger
+rss {action:"manage", op:"backfill", last:2, dry_run:true}      # preview ledger backfill
+rss {action:"manage", op:"backfill", last:2}                    # seed the ledger so 延续/repeat work immediately
 ```
 
 Basic and admin:
